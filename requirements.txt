@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+motor
+pydantic-settings
+pydantic[email]
+pyjwt[crypto]
+cryptography
+argon2-cffi
+httpx
+icecream
+python-multipart
+git+https://github.com/Siva-Rajan-R/hyperlocal_platform
