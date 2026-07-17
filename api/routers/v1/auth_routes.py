@@ -3,6 +3,7 @@ import uuid
 import httpx
 import jwt
 from fastapi import APIRouter, HTTPException, Depends, Query, Request, Response
+from fastapi.responses import RedirectResponse
 import json
 from pydantic import BaseModel, EmailStr
 from typing import Optional, List
@@ -217,10 +218,12 @@ async def callback(
     # Generate versioned tokens
     private_key_pem, _ = await get_keys_for_version(version)
     
+    now = datetime.datetime.now(datetime.timezone.utc)
     access_jti = str(uuid.uuid4())
-    access_exp = datetime.datetime.utcnow() + datetime.timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_exp = now + datetime.timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_payload = {
         "sub": user_id,
+        "user_id": user_id,
         "service_name": service,
         "type": "access",
         "version": version,
@@ -231,9 +234,10 @@ async def callback(
     }
     
     refresh_jti = str(uuid.uuid4())
-    refresh_exp = datetime.datetime.utcnow() + datetime.timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    refresh_exp = now + datetime.timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
     refresh_payload = {
         "sub": user_id,
+        "user_id": user_id,
         "service_name": service,
         "type": "refresh",
         "version": version,
@@ -249,12 +253,15 @@ async def callback(
     ic(access_token)
     ic(refresh_token)
     
-    return {
-        "access_token": access_token,
-        "refresh_token": refresh_token,
-        "token_type": "bearer",
-        "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60
-    }
+    # Redirect browser to frontend callback page with tokens as query params
+    redirect_url = (
+        f"{SETTINGS.FRONTEND_URL}/auth/callback"
+        f"?access_token={access_token}"
+        f"&refresh_token={refresh_token}"
+        f"&token_type=bearer"
+        f"&expires_in={ACCESS_TOKEN_EXPIRE_MINUTES * 60}"
+    )
+    return RedirectResponse(url=redirect_url)
 
 @router.post("/refresh")
 async def refresh_token(data: RefreshSchema):
@@ -278,15 +285,16 @@ async def refresh_token(data: RefreshSchema):
     # Issue new access token
     private_key_pem, _ = await get_keys_for_version(data.version)
     
-    user_id = payload["sub"]
+    user_id = payload.get("user_id") or payload["sub"]
     email = payload.get("email")
     mobilenumber = payload.get("mobilenumber")
     service = payload.get("service_name")
     
     access_jti = str(uuid.uuid4())
-    access_exp = datetime.datetime.utcnow() + datetime.timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_exp = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_payload = {
         "sub": user_id,
+        "user_id": user_id,
         "service_name": service,
         "type": "access",
         "version": data.version,

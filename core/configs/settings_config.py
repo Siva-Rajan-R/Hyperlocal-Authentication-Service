@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     ENVIRONMENT: str = "development"
     DEB_APIKEY: str
     DEB_SECRETS: str
+    FRONTEND_URL: str = "http://localhost:5173"
 
     class Config:
         env_file = ".env"
