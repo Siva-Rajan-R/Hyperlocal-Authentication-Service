@@ -260,13 +260,16 @@ async def callback(
         
         user_doc = {
             "user_id": user_id,
-            "email": email,
-            "mobilenumber": mobilenumber,
             "password": hashed_password,
             "two_factor": False,
             "created_at": datetime.datetime.utcnow(),
             "updated_at": datetime.datetime.utcnow()
         }
+        if email:
+            user_doc["email"] = email
+        if mobilenumber:
+            user_doc["mobilenumber"] = mobilenumber
+            
         await users_coll.insert_one(user_doc)
     else:
         user_id = user_doc["user_id"]

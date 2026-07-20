@@ -10,6 +10,10 @@ class MongoDBManager:
         cls.client = AsyncIOMotorClient(SETTINGS.MONGO_URL)
         cls.db = cls.client[SETTINGS.MONGO_DB_NAME]
         
+        # Clean up null values to allow sparse unique indexes to work correctly
+        await cls.db.users.update_many({"email": None}, {"$unset": {"email": ""}})
+        await cls.db.users.update_many({"mobilenumber": None}, {"$unset": {"mobilenumber": ""}})
+
         # Ensure Indexes
         await cls.db.users.create_index("user_id", unique=True)
         await cls.db.users.create_index("email", unique=True, sparse=True)
