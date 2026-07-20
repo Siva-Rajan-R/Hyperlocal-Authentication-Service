@@ -9,4 +9,5 @@ argon2-cffi
 httpx
 icecream
 python-multipart
+pyjwt
 git+https://github.com/Siva-Rajan-R/hyperlocal_platform

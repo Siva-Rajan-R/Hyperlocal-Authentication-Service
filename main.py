@@ -26,10 +26,14 @@ async def bootstrap_rsa_keys():
     })
     ic("RSA key version '1' generated and stored successfully.")
 
+from hyperlocal_platform.infras.redis.main import check_redis_health
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup: Connect to MongoDB
     await MongoDBManager.connect()
+    # Check Redis health
+    await check_redis_health()
     # Bootstrap RSA key version "1" if it doesn't exist
     await bootstrap_rsa_keys()
     yield

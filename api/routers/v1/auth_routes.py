@@ -17,6 +17,9 @@ from cryptography.hazmat.primitives import serialization
 
 from core.configs.settings_config import SETTINGS
 from infras.db.mongo import get_collection
+from dotenv import load_dotenv
+load_dotenv()
+from hyperlocal_platform.infras.redis.main import redis_client
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 ph = PasswordHasher()
@@ -129,7 +132,63 @@ async def callback(
     service: Optional[str] = Query(None),
     version: Optional[str] = Query(None)
 ):
-    # Try reading from cookie first if query params are missing
+    # 1. Check if token_id is a login_id stored in Redis
+    redis_key = f"login_id:{token_id}"
+    stored_payload_json = await redis_client.get(redis_key)
+    if stored_payload_json:
+        # This is a frontend exchange request!
+        payload = json.loads(stored_payload_json)
+        await redis_client.delete(redis_key)
+        
+        user_id = payload["user_id"]
+        email = payload.get("email")
+        mobilenumber = payload.get("mobilenumber")
+        service = payload.get("service", "HYPERLOCAL")
+        version = payload.get("version", "1")
+        
+        # Generate versioned tokens
+        private_key_pem, _ = await get_keys_for_version(version)
+        
+        now = datetime.datetime.now(datetime.timezone.utc)
+        access_jti = str(uuid.uuid4())
+        access_exp = now + datetime.timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        access_payload = {
+            "sub": user_id,
+            "user_id": user_id,
+            "service_name": service,
+            "type": "access",
+            "version": version,
+            "exp": int(access_exp.timestamp()),
+            "jti": access_jti,
+            "email": email,
+            "mobilenumber": mobilenumber
+        }
+        
+        refresh_jti = str(uuid.uuid4())
+        refresh_exp = now + datetime.timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+        refresh_payload = {
+            "sub": user_id,
+            "user_id": user_id,
+            "service_name": service,
+            "type": "refresh",
+            "version": version,
+            "exp": int(refresh_exp.timestamp()),
+            "jti": refresh_jti,
+            "email": email,
+            "mobilenumber": mobilenumber
+        }
+        
+        access_token = jwt.encode(access_payload, private_key_pem, algorithm="RS256")
+        refresh_token = jwt.encode(refresh_payload, private_key_pem, algorithm="RS256")
+        
+        return {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "token_type": "bearer",
+            "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60
+        }
+
+    # 2. Otherwise, treat it as the OAuth callback from Debugger Auth
     cookie_state = request.cookies.get("oauth_state")
     if cookie_state:
         try:
@@ -145,6 +204,7 @@ async def callback(
         service = "HYPERLOCAL"
     if not version:
         version = "1"
+        
     # Connects to Debugger Auth to get loggedin user
     constructed_url = "https://api.dauth.debuggers.co.in/auth/authenticated-user"
     async with httpx.AsyncClient(timeout=30) as client:
@@ -162,7 +222,6 @@ async def callback(
             status_code=response.status_code,
             detail="Failed to fetch authenticated user from Debugger Auth"
         )
-
     
     deb_data = response.json()
     ic(deb_data["token"])
@@ -175,7 +234,6 @@ async def callback(
     # Store user if not exists
     email = deb_user_info.get("email")
     mobilenumber = deb_user_info.get("mobilenumber") or deb_user_info.get("mobile_number")
-
     
     users_coll = get_collection("users")
     user_query = {}
@@ -215,51 +273,24 @@ async def callback(
         email = user_doc.get("email")
         mobilenumber = user_doc.get("mobilenumber")
 
-    # Generate versioned tokens
-    private_key_pem, _ = await get_keys_for_version(version)
+    # Generate a temporary login_id and store user payload in Redis
+    login_id = str(uuid.uuid4())
+    new_redis_key = f"login_id:{login_id}"
     
-    now = datetime.datetime.now(datetime.timezone.utc)
-    access_jti = str(uuid.uuid4())
-    access_exp = now + datetime.timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_payload = {
-        "sub": user_id,
+    user_context = {
         "user_id": user_id,
-        "service_name": service,
-        "type": "access",
-        "version": version,
-        "exp": int(access_exp.timestamp()),
-        "jti": access_jti,
         "email": email,
-        "mobilenumber": mobilenumber
+        "mobilenumber": mobilenumber,
+        "service": service,
+        "version": version
     }
     
-    refresh_jti = str(uuid.uuid4())
-    refresh_exp = now + datetime.timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
-    refresh_payload = {
-        "sub": user_id,
-        "user_id": user_id,
-        "service_name": service,
-        "type": "refresh",
-        "version": version,
-        "exp": int(refresh_exp.timestamp()),
-        "jti": refresh_jti,
-        "email": email,
-        "mobilenumber": mobilenumber
-    }
+    await redis_client.set(new_redis_key, json.dumps(user_context), ex=120)
     
-    access_token = jwt.encode(access_payload, private_key_pem, algorithm="RS256")
-    refresh_token = jwt.encode(refresh_payload, private_key_pem, algorithm="RS256")
-
-    ic(access_token)
-    ic(refresh_token)
-    
-    # Redirect browser to frontend callback page with tokens as query params
+    # Redirect browser to frontend callback page with the login_id as token_id
     redirect_url = (
         f"{SETTINGS.FRONTEND_URL}/auth/callback"
-        f"?access_token={access_token}"
-        f"&refresh_token={refresh_token}"
-        f"&token_type=bearer"
-        f"&expires_in={ACCESS_TOKEN_EXPIRE_MINUTES * 60}"
+        f"?token_id={login_id}"
     )
     return RedirectResponse(url=redirect_url)
 
