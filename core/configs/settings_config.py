@@ -9,6 +9,8 @@ class Settings(BaseSettings):
     DEB_APIKEY: str
     DEB_SECRETS: str
     FRONTEND_URL: str = "http://localhost:5173"
+    HYPERLOCAL_WEBSITE_URL: str = "http://localhost:5173/auth/callback"
+    APP_DEEP_LINK: str = "hyperlocal://auth/callback"
 
     class Config:
         env_file = ".env"

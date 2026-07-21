@@ -104,13 +104,30 @@ async def get_public_key(version: str):
     return {"version": version, "public_key": public_key}
 
 @router.get("/login-url")
-async def get_login_url(response: Response, service: str = Query(...), version: Optional[str] = Query("1")):
+async def get_login_url(
+    response: Response,
+    service: str = Query(...),
+    version: Optional[str] = Query("1"),
+    entity_name: Optional[str] = Query(None),
+    entity_type: Optional[str] = Query(None),
+    redirect_url: Optional[str] = Query(None)
+):
     # Connects to Debugger Auth
     constructed_url = "https://api.dauth.debuggers.co.in/auth"
+    payload = {
+        "apikey": SETTINGS.DEB_APIKEY,
+        "additional_infos": {
+            "entity_name": entity_name,
+            "entity_type": entity_type,
+            "redirect_url": redirect_url,
+            "service": service,
+            "version": version
+        }
+    }
     async with httpx.AsyncClient(timeout=30) as client:
         response_data = await client.post(
             constructed_url,
-            json={"apikey": SETTINGS.DEB_APIKEY}
+            json=payload
         )
     
     if response_data.status_code != 200:
@@ -121,7 +138,13 @@ async def get_login_url(response: Response, service: str = Query(...), version: 
     
     res = response_data.json()
     # Set the cookie with service and version info
-    state_val = json.dumps({"service": service, "version": version})
+    state_val = json.dumps({
+        "service": service,
+        "version": version,
+        "entity_name": entity_name,
+        "entity_type": entity_type,
+        "redirect_url": redirect_url
+    })
     response.set_cookie(key="oauth_state", value=state_val, max_age=900, samesite="lax")
     return res
 
@@ -145,6 +168,8 @@ async def callback(
         mobilenumber = payload.get("mobilenumber")
         service = payload.get("service", "HYPERLOCAL")
         version = payload.get("version", "1")
+        entity_name = payload.get("entity_name")
+        entity_type = payload.get("entity_type")
         
         # Generate versioned tokens
         private_key_pem, _ = await get_keys_for_version(version)
@@ -163,6 +188,10 @@ async def callback(
             "email": email,
             "mobilenumber": mobilenumber
         }
+        if entity_name:
+            access_payload["entity_name"] = entity_name
+        if entity_type:
+            access_payload["entity_type"] = entity_type
         
         refresh_jti = str(uuid.uuid4())
         refresh_exp = now + datetime.timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
@@ -177,6 +206,10 @@ async def callback(
             "email": email,
             "mobilenumber": mobilenumber
         }
+        if entity_name:
+            refresh_payload["entity_name"] = entity_name
+        if entity_type:
+            refresh_payload["entity_type"] = entity_type
         
         access_token = jwt.encode(access_payload, private_key_pem, algorithm="RS256")
         refresh_token = jwt.encode(refresh_payload, private_key_pem, algorithm="RS256")
@@ -190,6 +223,9 @@ async def callback(
 
     # 2. Otherwise, treat it as the OAuth callback from Debugger Auth
     cookie_state = request.cookies.get("oauth_state")
+    entity_name = None
+    entity_type = None
+    redirect_url_param = None
     if cookie_state:
         try:
             state_data = json.loads(cookie_state)
@@ -197,6 +233,9 @@ async def callback(
                 service = state_data.get("service")
             if not version:
                 version = state_data.get("version")
+            entity_name = state_data.get("entity_name")
+            entity_type = state_data.get("entity_type")
+            redirect_url_param = state_data.get("redirect_url")
         except Exception:
             pass
             
@@ -230,6 +269,18 @@ async def callback(
         options={"verify_signature": False}
     )
     ic(deb_user_info)
+    
+    additional_infos = deb_user_info.get("additional_infos") or {}
+    if "entity_name" in additional_infos:
+        entity_name = additional_infos.get("entity_name")
+    if "entity_type" in additional_infos:
+        entity_type = additional_infos.get("entity_type")
+    if "redirect_url" in additional_infos:
+        redirect_url_param = additional_infos.get("redirect_url")
+    if additional_infos.get("service"):
+        service = additional_infos.get("service")
+    if additional_infos.get("version"):
+        version = additional_infos.get("version")
     
     # Store user if not exists
     email = deb_user_info.get("email")
@@ -285,16 +336,35 @@ async def callback(
         "email": email,
         "mobilenumber": mobilenumber,
         "service": service,
-        "version": version
+        "version": version,
+        "entity_name": entity_name,
+        "entity_type": entity_type
     }
     
     await redis_client.set(new_redis_key, json.dumps(user_context), ex=120)
     
-    # Redirect browser to frontend callback page with the login_id as token_id
-    redirect_url = (
-        f"{SETTINGS.FRONTEND_URL}/auth/callback"
-        f"?token_id={login_id}"
-    )
+    def append_query_param(url: str, key: str, value: str) -> str:
+        from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+        parsed = urlparse(url)
+        params = parse_qsl(parsed.query)
+        params.append((key, value))
+        new_query = urlencode(params)
+        return urlunparse(parsed._replace(query=new_query))
+
+    base_redirect_url = None
+    if redirect_url_param:
+        base_redirect_url = redirect_url_param
+    else:
+        srv_upper = service.upper() if service else ""
+        ent_lower = entity_type.lower() if entity_type else ""
+        if srv_upper == "HYPERLOCAL" and ent_lower == "website":
+            base_redirect_url = SETTINGS.HYPERLOCAL_WEBSITE_URL
+        elif ent_lower == "app":
+            base_redirect_url = SETTINGS.APP_DEEP_LINK
+        else:
+            base_redirect_url = f"{SETTINGS.FRONTEND_URL}/auth/callback"
+
+    redirect_url = append_query_param(base_redirect_url, "token_id", login_id)
     return RedirectResponse(url=redirect_url)
 
 @router.post("/refresh")
@@ -323,6 +393,8 @@ async def refresh_token(data: RefreshSchema):
     email = payload.get("email")
     mobilenumber = payload.get("mobilenumber")
     service = payload.get("service_name")
+    entity_name = payload.get("entity_name")
+    entity_type = payload.get("entity_type")
     
     access_jti = str(uuid.uuid4())
     access_exp = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
@@ -337,6 +409,10 @@ async def refresh_token(data: RefreshSchema):
         "email": email,
         "mobilenumber": mobilenumber
     }
+    if entity_name:
+        access_payload["entity_name"] = entity_name
+    if entity_type:
+        access_payload["entity_type"] = entity_type
     
     new_access_token = jwt.encode(access_payload, private_key_pem, algorithm="RS256")
     
