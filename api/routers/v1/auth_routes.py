@@ -56,6 +56,9 @@ class UserResponseSchema(BaseModel):
     mobilenumber: Optional[str] = None
     two_factor: bool
 
+
+DAUTH_BASE_URL="https://api.dauth.debuggerstechnologies.com"
+
 # Helpers
 def generate_rsa_keypair():
     private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
@@ -113,7 +116,7 @@ async def get_login_url(
     redirect_url: Optional[str] = Query(None)
 ):
     # Connects to Debugger Auth
-    constructed_url = "https://api.dauth.debuggers.co.in/auth"
+    constructed_url = f"{DAUTH_BASE_URL}/auth"
     payload = {
         "apikey": SETTINGS.DEB_APIKEY,
         "additional_infos": {
@@ -129,6 +132,8 @@ async def get_login_url(
             constructed_url,
             json=payload
         )
+
+        ic(response_data.text)
     
     if response_data.status_code != 200:
         raise HTTPException(
@@ -245,7 +250,7 @@ async def callback(
         version = "1"
         
     # Connects to Debugger Auth to get loggedin user
-    constructed_url = "https://api.dauth.debuggers.co.in/auth/authenticated-user"
+    constructed_url = f"{DAUTH_BASE_URL}/auth/authenticated-user"
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.post(
             constructed_url,
