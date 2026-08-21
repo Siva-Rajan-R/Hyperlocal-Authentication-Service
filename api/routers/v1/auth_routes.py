@@ -45,6 +45,7 @@ class RevokeSchema(BaseModel):
     token: str
 
 class UserCreateManualSchema(BaseModel):
+    user_id: Optional[str] = None
     email: EmailStr
     mobilenumber: str
     password: str
@@ -470,7 +471,7 @@ async def create_user_manual(data: UserCreateManualSchema):
     if existing:
         raise HTTPException(status_code=400, detail="User with this email or mobile number already exists.")
         
-    user_id = str(uuid.uuid4())
+    user_id = data.user_id if data.user_id else str(uuid.uuid4())
     hashed_password = ph.hash(data.password)
     
     user_doc = {
