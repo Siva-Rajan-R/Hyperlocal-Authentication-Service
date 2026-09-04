@@ -189,3 +189,21 @@ async def log_requests(request: Request, call_next):
     
     return response
 # ------------------------------
+
+
+# --- INJECTED USER CONTEXT MIDDLEWARE ---
+import json
+from fastapi import Request
+from core.utils.user_context import current_user_ctx
+
+@app.middleware("http")
+async def user_context_middleware(request: Request, call_next):
+    user_infos_header = request.headers.get("x-user-infos")
+    if user_infos_header:
+        try:
+            user_infos = json.loads(user_infos_header)
+            current_user_ctx.set(user_infos)
+        except Exception:
+            pass
+    return await call_next(request)
+# ----------------------------------------
