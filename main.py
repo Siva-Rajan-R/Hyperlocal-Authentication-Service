@@ -205,5 +205,24 @@ async def user_context_middleware(request: Request, call_next):
             current_user_ctx.set(user_infos)
         except Exception:
             pass
+    else:
+        auth_header = request.headers.get("Authorization")
+        if auth_header and auth_header.startswith("Bearer "):
+            try:
+                import base64
+                token_parts = auth_header.split(" ")[1].split(".")
+                if len(token_parts) == 3:
+                    padded = token_parts[1] + "=" * ((4 - len(token_parts[1]) % 4) % 4)
+                    payload = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
+                    user_infos = {
+                        "user_id": payload.get("user_id") or payload.get("sub"),
+                        "id": payload.get("user_id") or payload.get("sub"),
+                        "name": payload.get("name") or payload.get("entity_name") or "",
+                        "email": payload.get("email") or "",
+                        "role": payload.get("role") or payload.get("entity_type") or "User"
+                    }
+                    current_user_ctx.set(user_infos)
+            except Exception:
+                pass
     return await call_next(request)
 # ----------------------------------------
