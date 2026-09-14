@@ -15,7 +15,9 @@ def get_activity_log_user_info(custom_user_info: Optional[dict] = None) -> dict:
         user_name = email.split("@")[0]
         
     final_name = user_name or "System"
-    role = user_info.get("role", "")
+    role = user_info.get("role", "") or user_info.get("user_role", "")
+    if not role and final_name != "System":
+        role = "Owner"
     
     if email and final_name != email and f"- {email}" not in final_name:
         final_name = f"{final_name} - {email}"
