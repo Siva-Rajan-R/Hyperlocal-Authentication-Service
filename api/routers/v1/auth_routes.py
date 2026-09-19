@@ -39,7 +39,7 @@ class CallbackSchema(BaseModel):
 
 class RefreshSchema(BaseModel):
     refresh_token: str
-    version: str
+    version: Optional[str] = "1"
 
 class RevokeSchema(BaseModel):
     token: str
@@ -375,8 +375,16 @@ async def callback(
 
 @router.post("/refresh")
 async def refresh_token(data: RefreshSchema):
+    version = data.version
+    if not version:
+        try:
+            unv = jwt.decode(data.refresh_token, options={"verify_signature": False})
+            version = unv.get("version", "1")
+        except Exception:
+            version = "1"
+
     # Verify signature using public key matching version
-    _, public_key_pem = await get_keys_for_version(data.version)
+    _, public_key_pem = await get_keys_for_version(version)
     
     try:
         payload = jwt.decode(data.refresh_token, public_key_pem, algorithms=["RS256"])
@@ -392,8 +400,8 @@ async def refresh_token(data: RefreshSchema):
     if is_revoked:
         raise HTTPException(status_code=401, detail="Refresh token has been revoked")
         
-    # Issue new access token
-    private_key_pem, _ = await get_keys_for_version(data.version)
+    # Issue new access token & fresh refresh token
+    private_key_pem, _ = await get_keys_for_version(version)
     
     user_id = payload.get("user_id") or payload["sub"]
     email = payload.get("email")
@@ -402,14 +410,15 @@ async def refresh_token(data: RefreshSchema):
     entity_name = payload.get("entity_name")
     entity_type = payload.get("entity_type")
     
+    now = datetime.datetime.now(datetime.timezone.utc)
     access_jti = str(uuid.uuid4())
-    access_exp = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_exp = now + datetime.timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_payload = {
         "sub": user_id,
         "user_id": user_id,
         "service_name": service,
         "type": "access",
-        "version": data.version,
+        "version": version,
         "exp": int(access_exp.timestamp()),
         "jti": access_jti,
         "email": email,
@@ -421,9 +430,30 @@ async def refresh_token(data: RefreshSchema):
         access_payload["entity_type"] = entity_type
     
     new_access_token = jwt.encode(access_payload, private_key_pem, algorithm="RS256")
+
+    refresh_jti = str(uuid.uuid4())
+    refresh_exp = now + datetime.timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    refresh_payload = {
+        "sub": user_id,
+        "user_id": user_id,
+        "service_name": service,
+        "type": "refresh",
+        "version": version,
+        "exp": int(refresh_exp.timestamp()),
+        "jti": refresh_jti,
+        "email": email,
+        "mobilenumber": mobilenumber
+    }
+    if entity_name:
+        refresh_payload["entity_name"] = entity_name
+    if entity_type:
+        refresh_payload["entity_type"] = entity_type
+
+    new_refresh_token = jwt.encode(refresh_payload, private_key_pem, algorithm="RS256")
     
     return {
         "access_token": new_access_token,
+        "refresh_token": new_refresh_token,
         "token_type": "bearer",
         "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60
     }
