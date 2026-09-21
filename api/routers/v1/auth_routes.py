@@ -3,9 +3,10 @@ import uuid
 import httpx
 import jwt
 from fastapi import APIRouter, HTTPException, Depends, Query, Request, Response
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, JSONResponse
 import json
-from pydantic import BaseModel, EmailStr
+import re
+from pydantic import BaseModel, EmailStr, field_validator
 from typing import Optional, List
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
@@ -51,14 +52,71 @@ class UserCreateManualSchema(BaseModel):
     password: str
     two_factor: bool = False
 
+    @field_validator("email")
+    @classmethod
+    def normalize_email(cls, v):
+        if isinstance(v, str):
+            return v.strip().lower()
+        return v
+
+class LoginRequestSchema(BaseModel):
+    email: Optional[str] = None
+    mobilenumber: Optional[str] = None
+    password: str
+    service: Optional[str] = "HYPERLOCAL"
+    version: Optional[str] = "1"
+    entity_name: Optional[str] = None
+    entity_type: Optional[str] = None
+
 class UserResponseSchema(BaseModel):
     user_id: str
     email: Optional[str] = None
     mobilenumber: Optional[str] = None
     two_factor: bool
 
+class ForgotPasswordSchema(BaseModel):
+    email: Optional[str] = None
+    mobilenumber: Optional[str] = None
+
+    @field_validator("email")
+    @classmethod
+    def normalize_email(cls, v):
+        if isinstance(v, str) and v.strip():
+            return v.strip().lower()
+        return v
+
+class ResetPasswordSchema(BaseModel):
+    reset_token: Optional[str] = None
+    email: Optional[str] = None
+    mobilenumber: Optional[str] = None
+    user_id: Optional[str] = None
+    new_password: str
+
+    @field_validator("email")
+    @classmethod
+    def normalize_email(cls, v):
+        if isinstance(v, str) and v.strip():
+            return v.strip().lower()
+        return v
+
+class ChangePasswordSchema(BaseModel):
+    email: Optional[str] = None
+    mobilenumber: Optional[str] = None
+    user_id: Optional[str] = None
+    old_password: str
+    new_password: str
+
+    @field_validator("email")
+    @classmethod
+    def normalize_email(cls, v):
+        if isinstance(v, str) and v.strip():
+            return v.strip().lower()
+        return v
+
+
 
 DAUTH_BASE_URL="https://api.dauth.debuggerstechnologies.com"
+# DAUTH_BASE_URL="http://127.0.0.1:9000"
 
 # Helpers
 def generate_rsa_keypair():
@@ -154,13 +212,130 @@ async def get_login_url(
     response.set_cookie(key="oauth_state", value=state_val, max_age=900, samesite="lax")
     return res
 
+@router.post("/callback/verify")
+async def callback_verify(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    ic("callback/verify request received:", body)
+    
+    flow_type = body.get("flow_type", "signin")
+    auth_provider = body.get("auth_provider", "password")
+    raw_email = body.get("email")
+    email = raw_email.strip().lower() if isinstance(raw_email, str) and raw_email.strip() else None
+    mobilenumber = body.get("mobile_number") or body.get("mobilenumber") or body.get("phone")
+    if isinstance(mobilenumber, str):
+        mobilenumber = mobilenumber.strip()
+    password = body.get("password")
+    
+    users_coll = get_collection("users")
+    query_or = []
+    if email:
+        query_or.append({"email": email})
+        query_or.append({"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}})
+    if mobilenumber:
+        query_or.append({"mobilenumber": mobilenumber})
+        
+    user_doc = await users_coll.find_one({"$or": query_or}) if query_or else None
+    
+    # 1. Signin Verification
+    if flow_type == "signin":
+        if not user_doc:
+            return JSONResponse(
+                status_code=401,
+                content={
+                    "message": "Account not found with this email or mobile number.",
+                    "status_code": 401,
+                    "success": False
+                }
+            )
+            
+        if auth_provider == "password" and password:
+            stored_pwd = user_doc.get("password")
+            has_custom_pwd = user_doc.get("has_custom_password", False)
+            
+            if stored_pwd and has_custom_pwd:
+                try:
+                    ph.verify(stored_pwd, password)
+                except Exception:
+                    return JSONResponse(
+                        status_code=401,
+                        content={
+                            "message": "Incorrect password. Please check your credentials.",
+                            "status_code": 401,
+                            "success": False
+                        }
+                    )
+                    
+        return JSONResponse(
+            status_code=200,
+            content={
+                "success": True,
+                "message": "Verification successful.",
+                "user_id": user_doc.get("user_id"),
+                "email": user_doc.get("email"),
+                "mobilenumber": user_doc.get("mobilenumber")
+            }
+        )
+        
+    # 2. Signup Verification
+    elif flow_type == "signup":
+        if user_doc:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "message": "An account with this email or mobile number already exists.",
+                    "status_code": 409,
+                    "success": False
+                }
+            )
+        return JSONResponse(
+            status_code=200,
+            content={
+                "success": True,
+                "message": "Verification successful. New user allowed to register."
+            }
+        )
+        
+    # 3. Default fallback
+    return JSONResponse(
+        status_code=200,
+        content={
+            "success": True,
+            "message": "Verification successful."
+        }
+    )
+
+        
 @router.get("/callback")
 async def callback(
     request: Request,
-    token_id: str = Query(...),
+    token_id: Optional[str] = Query(None),
+    error: Optional[str] = Query(None),
+    status_code: Optional[int] = Query(None),
     service: Optional[str] = Query(None),
     version: Optional[str] = Query(None)
 ):
+    # If error parameter is present from DAuth failure redirect
+    if error:
+        cookie_state = request.cookies.get("oauth_state")
+        redirect_url_param = None
+        if cookie_state:
+            try:
+                state_data = json.loads(cookie_state)
+                redirect_url_param = state_data.get("redirect_url")
+            except Exception:
+                pass
+        base_redirect_url = redirect_url_param or f"{SETTINGS.FRONTEND_URL}/auth/callback"
+        from urllib.parse import quote
+        sep = "&" if "?" in base_redirect_url else "?"
+        status_part = f"&status_code={status_code}" if status_code else ""
+        return RedirectResponse(url=f"{base_redirect_url}{sep}error={quote(str(error))}{status_part}")
+
+    if not token_id:
+        raise HTTPException(status_code=400, detail="Missing token_id in callback")
+
     # 1. Check if token_id is a login_id stored in Redis
     redis_key = f"login_id:{token_id}"
     stored_payload_json = await redis_client.get(redis_key)
@@ -289,13 +464,19 @@ async def callback(
         version = additional_infos.get("version")
     
     # Store user if not exists
-    email = deb_user_info.get("email")
+    raw_email = deb_user_info.get("email")
+    email = raw_email.strip().lower() if isinstance(raw_email, str) and raw_email.strip() else None
     mobilenumber = deb_user_info.get("mobilenumber") or deb_user_info.get("mobile_number")
+    if isinstance(mobilenumber, str):
+        mobilenumber = mobilenumber.strip()
     
     users_coll = get_collection("users")
     user_query = {}
     if email:
-        user_query["email"] = email
+        user_query["$or"] = [
+            {"email": email},
+            {"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}}
+        ]
     elif mobilenumber:
         user_query["mobilenumber"] = mobilenumber
         
@@ -307,17 +488,22 @@ async def callback(
         user_id = deb_user_info.get("user_id") or deb_user_info.get("id") or str(uuid.uuid4())
         
         # Determine password based on auth_provider
-        auth_provider = deb_user_info.get("auth_provider")
-        if auth_provider == "password" and deb_user_info.get("password"):
-            password_val = deb_user_info.get("password")
+        auth_provider = deb_user_info.get("auth_provider") or deb_user_info.get("provider") or deb_user_info.get("login_type")
+        incoming_password = deb_user_info.get("password")
+        
+        if (auth_provider == "password" or incoming_password) and incoming_password:
+            password_val = incoming_password
+            has_custom_password = True
         else:
             password_val = str(uuid.uuid4())
+            has_custom_password = False
             
         hashed_password = ph.hash(password_val)
         
         user_doc = {
             "user_id": user_id,
             "password": hashed_password,
+            "has_custom_password": has_custom_password,
             "two_factor": False,
             "created_at": datetime.datetime.utcnow(),
             "updated_at": datetime.datetime.utcnow()
@@ -330,8 +516,71 @@ async def callback(
         await users_coll.insert_one(user_doc)
     else:
         user_id = user_doc["user_id"]
-        email = user_doc.get("email")
-        mobilenumber = user_doc.get("mobilenumber")
+        email = user_doc.get("email") or email
+        mobilenumber = user_doc.get("mobilenumber") or mobilenumber
+        
+        auth_provider = deb_user_info.get("auth_provider") or deb_user_info.get("provider") or deb_user_info.get("login_type")
+        incoming_password = deb_user_info.get("password")
+        new_password_field = deb_user_info.get("new_password")
+        
+        is_reset_event = bool(
+            auth_provider in ("forgot-password", "forgot_password", "reset_password", "password_reset")
+            or deb_user_info.get("flow_type") == "password_reset"
+            or deb_user_info.get("is_reset")
+            or deb_user_info.get("is_password_reset")
+            or deb_user_info.get("action") in ("reset_password", "forgot_password", "change_password", "reset", "update_password")
+            or deb_user_info.get("event") in ("reset_password", "forgot_password", "change_password", "reset")
+            or new_password_field
+        )
+        effective_new_pwd = new_password_field or incoming_password
+
+        # If it's a reset / forgot password event, directly update with new password
+        if is_reset_event and effective_new_pwd:
+            new_hash = ph.hash(effective_new_pwd)
+            await users_coll.update_one(
+                {"_id": user_doc["_id"]},
+                {"$set": {
+                    "password": new_hash,
+                    "has_custom_password": True,
+                    "updated_at": datetime.datetime.utcnow()
+                }}
+            )
+        # If user logged in via password, verify with stored password
+        elif auth_provider == "password" or incoming_password:
+            if incoming_password:
+                stored_pwd_hash = user_doc.get("password")
+                has_custom_pwd = user_doc.get("has_custom_password", False)
+                if stored_pwd_hash and has_custom_pwd:
+                    try:
+                        ph.verify(stored_pwd_hash, incoming_password)
+                    except VerifyMismatchError:
+                        raise HTTPException(
+                            status_code=401,
+                            detail="Invalid password. Please check your credentials."
+                        )
+                    except Exception as e:
+                        raise HTTPException(
+                            status_code=401,
+                            detail=f"Password verification failed: {str(e)}"
+                        )
+                    
+                    if ph.check_needs_rehash(stored_pwd_hash):
+                        new_hash = ph.hash(incoming_password)
+                        await users_coll.update_one(
+                            {"_id": user_doc["_id"]},
+                            {"$set": {"password": new_hash, "updated_at": datetime.datetime.utcnow()}}
+                        )
+                else:
+                    # User was previously created via OTP / OAuth; store their password now
+                    new_hash = ph.hash(incoming_password)
+                    await users_coll.update_one(
+                        {"_id": user_doc["_id"]},
+                        {"$set": {
+                            "password": new_hash,
+                            "has_custom_password": True,
+                            "updated_at": datetime.datetime.utcnow()
+                        }}
+                    )
 
     # Generate a temporary login_id and store user payload in Redis
     login_id = str(uuid.uuid4())
@@ -495,9 +744,17 @@ async def revoke_token(data: RevokeSchema):
 @router.post("/users", response_model=UserResponseSchema)
 async def create_user_manual(data: UserCreateManualSchema):
     users_coll = get_collection("users")
+    normalized_email = data.email.strip().lower() if data.email else None
     
-    # Check if exists
-    existing = await users_coll.find_one({"$or": [{"email": data.email}, {"mobilenumber": data.mobilenumber}]})
+    # Check if exists (case-insensitive email matching)
+    query_or = []
+    if normalized_email:
+        query_or.append({"email": normalized_email})
+        query_or.append({"email": {"$regex": f"^{re.escape(normalized_email)}$", "$options": "i"}})
+    if data.mobilenumber:
+        query_or.append({"mobilenumber": data.mobilenumber.strip()})
+        
+    existing = await users_coll.find_one({"$or": query_or}) if query_or else None
     if existing:
         raise HTTPException(status_code=400, detail="User with this email or mobile number already exists.")
         
@@ -506,15 +763,109 @@ async def create_user_manual(data: UserCreateManualSchema):
     
     user_doc = {
         "user_id": user_id,
-        "email": data.email,
-        "mobilenumber": data.mobilenumber,
+        "email": normalized_email,
+        "mobilenumber": data.mobilenumber.strip() if data.mobilenumber else None,
         "password": hashed_password,
+        "has_custom_password": True,
         "two_factor": data.two_factor,
         "created_at": datetime.datetime.utcnow(),
         "updated_at": datetime.datetime.utcnow()
     }
     await users_coll.insert_one(user_doc)
     return user_doc
+
+@router.post("/login")
+async def login_with_password(data: LoginRequestSchema):
+    if not data.email and not data.mobilenumber:
+        raise HTTPException(status_code=400, detail="Email or mobile number is required")
+    
+    users_coll = get_collection("users")
+    query_or = []
+    if data.email:
+        clean_email = data.email.strip().lower()
+        query_or.append({"email": clean_email})
+        query_or.append({"email": {"$regex": f"^{re.escape(clean_email)}$", "$options": "i"}})
+    if data.mobilenumber:
+        query_or.append({"mobilenumber": data.mobilenumber.strip()})
+        
+    user_doc = await users_coll.find_one({"$or": query_or}) if query_or else None
+    if not user_doc:
+        raise HTTPException(status_code=401, detail="Invalid email/mobile or password.")
+        
+    stored_pwd = user_doc.get("password")
+    if not stored_pwd:
+        raise HTTPException(status_code=401, detail="No password set for this account. Please login via OTP or OAuth.")
+        
+    try:
+        ph.verify(stored_pwd, data.password)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid email/mobile or password.")
+        
+    if ph.check_needs_rehash(stored_pwd):
+        new_hash = ph.hash(data.password)
+        await users_coll.update_one(
+            {"_id": user_doc["_id"]},
+            {"$set": {"password": new_hash, "updated_at": datetime.datetime.utcnow()}}
+        )
+        
+    version = data.version or "1"
+    private_key_pem, _ = await get_keys_for_version(version)
+    
+    user_id = user_doc["user_id"]
+    email = user_doc.get("email")
+    mobilenumber = user_doc.get("mobilenumber")
+    
+    now = datetime.datetime.now(datetime.timezone.utc)
+    access_jti = str(uuid.uuid4())
+    access_exp = now + datetime.timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_payload = {
+        "sub": user_id,
+        "user_id": user_id,
+        "service_name": data.service or "HYPERLOCAL",
+        "type": "access",
+        "version": version,
+        "exp": int(access_exp.timestamp()),
+        "jti": access_jti,
+        "email": email,
+        "mobilenumber": mobilenumber
+    }
+    if data.entity_name:
+        access_payload["entity_name"] = data.entity_name
+    if data.entity_type:
+        access_payload["entity_type"] = data.entity_type
+        
+    refresh_jti = str(uuid.uuid4())
+    refresh_exp = now + datetime.timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    refresh_payload = {
+        "sub": user_id,
+        "user_id": user_id,
+        "service_name": data.service or "HYPERLOCAL",
+        "type": "refresh",
+        "version": version,
+        "exp": int(refresh_exp.timestamp()),
+        "jti": refresh_jti,
+        "email": email,
+        "mobilenumber": mobilenumber
+    }
+    if data.entity_name:
+        refresh_payload["entity_name"] = data.entity_name
+    if data.entity_type:
+        refresh_payload["entity_type"] = data.entity_type
+        
+    access_token = jwt.encode(access_payload, private_key_pem, algorithm="RS256")
+    refresh_token = jwt.encode(refresh_payload, private_key_pem, algorithm="RS256")
+    
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+        "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        "user": {
+            "user_id": user_id,
+            "email": email,
+            "mobilenumber": mobilenumber
+        }
+    }
 
 @router.get("/users", response_model=List[UserResponseSchema])
 async def get_all_users():
@@ -536,7 +887,13 @@ async def get_user_by_id(user_id: str):
 @router.get("/users/by-email/{email}", response_model=UserResponseSchema)
 async def get_user_by_email(email: str):
     users_coll = get_collection("users")
-    user = await users_coll.find_one({"email": email})
+    clean_email = email.strip().lower()
+    user = await users_coll.find_one({
+        "$or": [
+            {"email": clean_email},
+            {"email": {"$regex": f"^{re.escape(clean_email)}$", "$options": "i"}}
+        ]
+    })
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     return user
@@ -556,3 +913,135 @@ async def delete_user(user_id: str):
     if res.deleted_count == 0:
         raise HTTPException(status_code=404, detail="User not found")
     return {"message": "User deleted successfully"}
+
+
+# Password Reset & Management Endpoints
+
+@router.post("/forgot-password")
+async def forgot_password(data: ForgotPasswordSchema):
+    if not data.email and not data.mobilenumber:
+        raise HTTPException(status_code=400, detail="Email or mobile number is required.")
+    
+    users_coll = get_collection("users")
+    query_or = []
+    if data.email:
+        clean_email = data.email.strip().lower()
+        query_or.append({"email": clean_email})
+        query_or.append({"email": {"$regex": f"^{re.escape(clean_email)}$", "$options": "i"}})
+    if data.mobilenumber:
+        query_or.append({"mobilenumber": data.mobilenumber.strip()})
+        
+    user_doc = await users_coll.find_one({"$or": query_or}) if query_or else None
+    if not user_doc:
+        raise HTTPException(status_code=404, detail="User with this email/mobile number not found.")
+        
+    reset_token = str(uuid.uuid4())
+    redis_key = f"pwd_reset:{reset_token}"
+    token_payload = {
+        "user_id": user_doc["user_id"],
+        "email": user_doc.get("email"),
+        "mobilenumber": user_doc.get("mobilenumber")
+    }
+    # Store token in Redis for 15 minutes (900 seconds)
+    await redis_client.set(redis_key, json.dumps(token_payload), ex=900)
+    
+    return {
+        "message": "Password reset token generated successfully.",
+        "reset_token": reset_token,
+        "user_id": user_doc["user_id"],
+        "email": user_doc.get("email"),
+        "mobilenumber": user_doc.get("mobilenumber"),
+        "expires_in_seconds": 900
+    }
+
+@router.post("/reset-password")
+async def reset_password(data: ResetPasswordSchema):
+    if not data.new_password:
+        raise HTTPException(status_code=400, detail="New password is required.")
+    
+    users_coll = get_collection("users")
+    user_id = data.user_id
+    
+    if data.reset_token:
+        redis_key = f"pwd_reset:{data.reset_token}"
+        stored_payload_json = await redis_client.get(redis_key)
+        if not stored_payload_json:
+            raise HTTPException(status_code=400, detail="Invalid or expired reset token.")
+        
+        token_data = json.loads(stored_payload_json)
+        user_id = token_data.get("user_id") or user_id
+        await redis_client.delete(redis_key)
+        
+    query_or = []
+    if user_id:
+        query_or.append({"user_id": user_id})
+    if data.email:
+        clean_email = data.email.strip().lower()
+        query_or.append({"email": clean_email})
+        query_or.append({"email": {"$regex": f"^{re.escape(clean_email)}$", "$options": "i"}})
+    if data.mobilenumber:
+        query_or.append({"mobilenumber": data.mobilenumber.strip()})
+        
+    if not query_or:
+        raise HTTPException(status_code=400, detail="Reset token, user_id, email, or mobile number is required.")
+        
+    user_doc = await users_coll.find_one({"$or": query_or})
+    if not user_doc:
+        raise HTTPException(status_code=404, detail="User not found.")
+        
+    new_hash = ph.hash(data.new_password)
+    await users_coll.update_one(
+        {"_id": user_doc["_id"]},
+        {"$set": {
+            "password": new_hash,
+            "has_custom_password": True,
+            "updated_at": datetime.datetime.utcnow()
+        }}
+    )
+    
+    return {"message": "Password has been successfully updated. You can now login with your new password."}
+
+@router.post("/change-password")
+async def change_password(data: ChangePasswordSchema):
+    if not data.old_password or not data.new_password:
+        raise HTTPException(status_code=400, detail="Both old and new passwords are required.")
+        
+    users_coll = get_collection("users")
+    query_or = []
+    if data.user_id:
+        query_or.append({"user_id": data.user_id})
+    if data.email:
+        clean_email = data.email.strip().lower()
+        query_or.append({"email": clean_email})
+        query_or.append({"email": {"$regex": f"^{re.escape(clean_email)}$", "$options": "i"}})
+    if data.mobilenumber:
+        query_or.append({"mobilenumber": data.mobilenumber.strip()})
+        
+    if not query_or:
+        raise HTTPException(status_code=400, detail="User identifier (user_id, email, or mobile number) is required.")
+        
+    user_doc = await users_coll.find_one({"$or": query_or})
+    if not user_doc:
+        raise HTTPException(status_code=404, detail="User not found.")
+        
+    stored_pwd = user_doc.get("password")
+    has_custom_pwd = user_doc.get("has_custom_password", False)
+    
+    if stored_pwd and has_custom_pwd:
+        try:
+            ph.verify(stored_pwd, data.old_password)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid current password.")
+            
+    new_hash = ph.hash(data.new_password)
+    await users_coll.update_one(
+        {"_id": user_doc["_id"]},
+        {"$set": {
+            "password": new_hash,
+            "has_custom_password": True,
+            "updated_at": datetime.datetime.utcnow()
+        }}
+    )
+    
+    return {"message": "Password changed successfully."}
+

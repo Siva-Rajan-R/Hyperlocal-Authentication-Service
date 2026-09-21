@@ -1,5 +1,5 @@
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from contextlib import asynccontextmanager
 from api.routers.v1 import auth_routes
 from infras.db.mongo import MongoDBManager, get_collection
@@ -48,8 +48,24 @@ app = FastAPI(
 
 app.include_router(auth_routes.router)
 
+from fastapi.responses import RedirectResponse
+from urllib.parse import quote
+
+@app.get("/")
+async def root_fallback(request: Request):
+    error = request.query_params.get("error")
+    if error:
+        frontend_url = SETTINGS.FRONTEND_URL or "http://localhost:5173"
+        return RedirectResponse(url=f"{frontend_url}/auth/callback?error={quote(str(error))}")
+    return {"service": "Authentication-Service", "status": "running"}
+
+@app.post("/callback/verify")
+async def root_callback_verify(request: Request):
+    return await auth_routes.callback_verify(request)
+
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=SETTINGS.PORT, reload=True)
+
 
 
 
