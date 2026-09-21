@@ -14,15 +14,23 @@ class MongoDBManager:
         await cls.db.users.update_many({"email": None}, {"$unset": {"email": ""}})
         await cls.db.users.update_many({"mobilenumber": None}, {"$unset": {"mobilenumber": ""}})
 
+        import pymongo.errors
         # Normalize existing user emails to lowercase
         cursor = cls.db.users.find({"email": {"$exists": True, "$ne": None}})
         async for doc in cursor:
             raw_email = doc.get("email")
             if isinstance(raw_email, str) and raw_email.strip() and raw_email != raw_email.strip().lower():
-                await cls.db.users.update_one(
-                    {"_id": doc["_id"]},
-                    {"$set": {"email": raw_email.strip().lower()}}
-                )
+                try:
+                    await cls.db.users.update_one(
+                        {"_id": doc["_id"]},
+                        {"$set": {"email": raw_email.strip().lower()}}
+                    )
+                except pymongo.errors.DuplicateKeyError:
+                    # Resolve collision by appending a duplicate suffix
+                    await cls.db.users.update_one(
+                        {"_id": doc["_id"]},
+                        {"$set": {"email": f"{raw_email.strip().lower()}_dup_{doc['_id']}"}}
+                    )
 
         # Ensure Indexes
         await cls.db.users.create_index("user_id", unique=True)
