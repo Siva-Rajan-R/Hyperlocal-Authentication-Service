@@ -115,8 +115,8 @@ class ChangePasswordSchema(BaseModel):
 
 
 
-# DAUTH_BASE_URL="https://api.dauth.debuggerstechnologies.com"
-DAUTH_BASE_URL="http://127.0.0.1:9000"
+DAUTH_BASE_URL="https://api.dauth.debuggerstechnologies.com"
+# DAUTH_BASE_URL="http://127.0.0.1:9000"
 
 # Helpers
 def generate_rsa_keypair():
