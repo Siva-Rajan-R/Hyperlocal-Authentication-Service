@@ -242,3 +242,75 @@ async def user_context_middleware(request: Request, call_next):
                 pass
     return await call_next(request)
 # ----------------------------------------
+
+# --- INJECTED SUBSCRIPTION GUARD MIDDLEWARE ---
+from fastapi import Request
+from fastapi.responses import JSONResponse
+
+@app.middleware("http")
+async def subscription_guard_middleware(request: Request, call_next):
+    path = request.url.path
+    if request.method == "OPTIONS":
+        return await call_next(request)
+
+    # Shop info, authentication, subscriptions, and internal routes are always accessible
+    is_exempt = (
+        "/internal/" in path
+        or path.startswith("/internal")
+        or path.startswith("/health")
+        or path.startswith("/docs")
+        or path.startswith("/openapi.json")
+        or path.startswith("/redoc")
+        or path.startswith("/auth")
+        or path.startswith("/api/auth")
+        or "/subscriptions" in path
+        or "/shops" in path
+        or "/verify" in path
+    )
+
+    if not is_exempt:
+        mock_expired = (
+            os.getenv("MOCK_SUBSCRIPTION_EXPIRED", "false").lower() in ("true", "1", "yes")
+            or os.getenv("MOCK_TRIAL_EXPIRED", "false").lower() in ("true", "1", "yes")
+        )
+        x_shop_id = request.headers.get("x-shop-id") or request.query_params.get("shop_id")
+        
+        is_expired = mock_expired
+        if not is_expired and x_shop_id and x_shop_id != "string":
+            try:
+                from motor.motor_asyncio import AsyncIOMotorClient
+                from datetime import datetime, timezone
+                mongo_url = os.getenv("READ_DB_URL", "mongodb://127.0.0.1:27017")
+                client = AsyncIOMotorClient(mongo_url)
+                sub_doc = await client["ShopEmpServiceDb"]["shop_subscriptions"].find_one({"shop_id": x_shop_id})
+                if sub_doc:
+                    if sub_doc.get("is_expired") or sub_doc.get("status") == "expired":
+                        is_expired = True
+                    elif sub_doc.get("status") == "trialing" and sub_doc.get("trial_ends_at"):
+                        # Automatic timestamp check: after 14 days, trial is expired!
+                        try:
+                            trial_end = datetime.fromisoformat(sub_doc["trial_ends_at"].replace("Z", "+00:00"))
+                            if datetime.now(timezone.utc) > trial_end:
+                                is_expired = True
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        if is_expired:
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "detail": {
+                        "msg": "Subscription Expired",
+                        "status_code": 403,
+                        "success": False,
+                        "status_type": "error",
+                        "title": "Subscription Expired",
+                        "description": "Your 14-day trial / subscription has ended. All operations and data views for this workspace are locked until renewed."
+                    }
+                }
+            )
+
+    return await call_next(request)
+# ---------------------------------------------
