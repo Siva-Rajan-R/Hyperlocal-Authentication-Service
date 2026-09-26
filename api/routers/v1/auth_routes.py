@@ -242,12 +242,37 @@ async def callback_verify(request: Request):
     # 1. Signin Verification
     if flow_type == "signin":
         if not user_doc:
+            user_id = str(uuid.uuid4())
+            if password:
+                hashed_password = ph.hash(password)
+                has_custom_pwd = True
+            else:
+                hashed_password = ph.hash(str(uuid.uuid4()))
+                has_custom_pwd = False
+
+            user_doc = {
+                "user_id": user_id,
+                "password": hashed_password,
+                "has_custom_password": has_custom_pwd,
+                "two_factor": False,
+                "created_at": datetime.datetime.utcnow(),
+                "updated_at": datetime.datetime.utcnow()
+            }
+            if email:
+                user_doc["email"] = email
+            if mobilenumber:
+                user_doc["mobilenumber"] = mobilenumber
+
+            await users_coll.insert_one(user_doc)
+
             return JSONResponse(
-                status_code=401,
+                status_code=200,
                 content={
-                    "message": "Account not found with this email or mobile number.",
-                    "status_code": 401,
-                    "success": False
+                    "success": True,
+                    "message": "Account created and verified successfully.",
+                    "user_id": user_doc.get("user_id"),
+                    "email": user_doc.get("email"),
+                    "mobilenumber": user_doc.get("mobilenumber")
                 }
             )
             
