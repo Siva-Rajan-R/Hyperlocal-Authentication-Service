@@ -59,9 +59,39 @@ async def root_fallback(request: Request):
         return RedirectResponse(url=f"{frontend_url}/auth/callback?error={quote(str(error))}")
     return {"service": "Authentication-Service", "status": "running"}
 
-@app.post("/callback/verify")
+@app.api_route("/signin/verify", methods=["GET", "POST", "OPTIONS", "HEAD"])
+@app.api_route("/login/verify", methods=["GET", "POST", "OPTIONS", "HEAD"])
+@app.api_route("/api/auth/signin/verify", methods=["GET", "POST", "OPTIONS", "HEAD"])
+async def root_signin_verify(request: Request):
+    return await auth_routes.signin_verify(request)
+
+@app.api_route("/signup/verify", methods=["GET", "POST", "OPTIONS", "HEAD"])
+@app.api_route("/callback/signup/verify", methods=["GET", "POST", "OPTIONS", "HEAD"])
+@app.api_route("/api/auth/signup/verify", methods=["GET", "POST", "OPTIONS", "HEAD"])
+async def root_signup_verify(request: Request):
+    return await auth_routes.signup_verify(request)
+
+@app.api_route("/verify", methods=["GET", "POST", "OPTIONS", "HEAD"])
+@app.api_route("/api/auth/verify", methods=["GET", "POST", "OPTIONS", "HEAD"])
+@app.api_route("/callback/verify", methods=["GET", "POST", "OPTIONS", "HEAD"])
+@app.api_route("/verify-signin", methods=["GET", "POST", "OPTIONS", "HEAD"])
 async def root_callback_verify(request: Request):
     return await auth_routes.callback_verify(request)
+
+@app.get("/signin/redirect")
+@app.get("/signin/callback")
+@app.get("/signup/redirect")
+@app.get("/signup/callback")
+@app.get("/callback")
+async def root_callback(request: Request):
+    return await auth_routes.callback(
+        request=request,
+        token_id=request.query_params.get("token_id"),
+        error=request.query_params.get("error"),
+        status_code=int(request.query_params.get("status_code")) if request.query_params.get("status_code") else None,
+        service=request.query_params.get("service"),
+        version=request.query_params.get("version")
+    )
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=SETTINGS.PORT, reload=True)
