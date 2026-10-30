@@ -29,3 +29,14 @@ env/
 .env
 .env.*
 !.env.example
+# Secrets, Keys & Certificates
+*.pem
+*.key
+*.crt
+*.cert
+*.pfx
+*.p12
+*.cer
+secrets/
+certs/
+*credentials*.json

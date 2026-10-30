@@ -250,13 +250,10 @@ async def get_login_url(
     payload = {
         "apikey": SETTINGS.DEB_APIKEY,
         "flow_type": "signin",
-        "redirect_url": backend_redirect_url,
-        "verify_url": effective_verify_url,
         "additional_infos": {
             "entity_name": entity_name,
             "entity_type": entity_type,
             "redirect_url": frontend_target_url,
-            "verify_url": effective_verify_url,
             "service": service,
             "version": version,
             "flow_type": "signin"
@@ -316,13 +313,10 @@ async def get_signup_url(
     payload = {
         "apikey": SETTINGS.DEB_APIKEY,
         "flow_type": "signup",
-        "redirect_url": backend_redirect_url,
-        "verify_url": effective_verify_url,
         "additional_infos": {
             "entity_name": entity_name,
             "entity_type": entity_type,
             "redirect_url": frontend_target_url,
-            "verify_url": effective_verify_url,
             "service": service,
             "version": version,
             "flow_type": "signup"
@@ -502,6 +496,7 @@ def _parse_identifiers(body: dict):
     return email, mobilenumber, password, auth_provider
 
 @router.api_route("/signin/verify", methods=["GET", "POST", "OPTIONS", "HEAD"])
+@router.api_route("/signin/callback/verify", methods=["GET", "POST", "OPTIONS", "HEAD"])
 @router.api_route("/login/verify", methods=["GET", "POST", "OPTIONS", "HEAD"])
 async def signin_verify(request: Request):
     """
@@ -1124,15 +1119,17 @@ async def callback(
                     try:
                         ph.verify(stored_pwd_hash, incoming_password)
                     except VerifyMismatchError:
-                        raise HTTPException(
-                            status_code=401,
-                            detail="Invalid password. Please check your credentials."
-                        )
+                        from urllib.parse import quote
+                        base_redirect_url = redirect_url_param or f"{SETTINGS.FRONTEND_URL}/login"
+                        sep = "&" if "?" in base_redirect_url else "?"
+                        err_msg = "Invalid password. Please check your credentials."
+                        return RedirectResponse(url=f"{base_redirect_url}{sep}error={quote(err_msg)}&status_code=401")
                     except Exception as e:
-                        raise HTTPException(
-                            status_code=401,
-                            detail=f"Password verification failed: {str(e)}"
-                        )
+                        from urllib.parse import quote
+                        base_redirect_url = redirect_url_param or f"{SETTINGS.FRONTEND_URL}/login"
+                        sep = "&" if "?" in base_redirect_url else "?"
+                        err_msg = f"Password verification failed: {str(e)}"
+                        return RedirectResponse(url=f"{base_redirect_url}{sep}error={quote(err_msg)}&status_code=401")
                     
                     if ph.check_needs_rehash(stored_pwd_hash):
                         new_hash = ph.hash(incoming_password)

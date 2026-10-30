@@ -60,8 +60,10 @@ async def root_fallback(request: Request):
     return {"service": "Authentication-Service", "status": "running"}
 
 @app.api_route("/signin/verify", methods=["GET", "POST", "OPTIONS", "HEAD"])
+@app.api_route("/signin/callback/verify", methods=["GET", "POST", "OPTIONS", "HEAD"])
 @app.api_route("/login/verify", methods=["GET", "POST", "OPTIONS", "HEAD"])
 @app.api_route("/api/auth/signin/verify", methods=["GET", "POST", "OPTIONS", "HEAD"])
+@app.api_route("/api/auth/signin/callback/verify", methods=["GET", "POST", "OPTIONS", "HEAD"])
 async def root_signin_verify(request: Request):
     return await auth_routes.signin_verify(request)
 
