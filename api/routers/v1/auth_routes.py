@@ -41,7 +41,7 @@ class CallbackSchema(BaseModel):
 
 class RefreshSchema(BaseModel):
     refresh_token: str
-    version: Optional[str] = "1"
+    version: Optional[str] = None
 
 class RevokeSchema(BaseModel):
     token: str
@@ -1339,6 +1339,8 @@ async def refresh_token(data: RefreshSchema):
     service = payload.get("service_name")
     entity_name = payload.get("entity_name")
     entity_type = payload.get("entity_type")
+    role = payload.get("role")
+    shop_id = payload.get("shop_id")
     
     now = datetime.datetime.now(datetime.timezone.utc)
     access_jti = str(uuid.uuid4())
@@ -1358,6 +1360,10 @@ async def refresh_token(data: RefreshSchema):
         access_payload["entity_name"] = entity_name
     if entity_type:
         access_payload["entity_type"] = entity_type
+    if role:
+        access_payload["role"] = role
+    if shop_id:
+        access_payload["shop_id"] = shop_id
     
     new_access_token = jwt.encode(access_payload, private_key_pem, algorithm="RS256")
 
@@ -1378,6 +1384,10 @@ async def refresh_token(data: RefreshSchema):
         refresh_payload["entity_name"] = entity_name
     if entity_type:
         refresh_payload["entity_type"] = entity_type
+    if role:
+        refresh_payload["role"] = role
+    if shop_id:
+        refresh_payload["shop_id"] = shop_id
 
     new_refresh_token = jwt.encode(refresh_payload, private_key_pem, algorithm="RS256")
     
