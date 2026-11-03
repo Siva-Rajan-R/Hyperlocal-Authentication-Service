@@ -8,6 +8,13 @@ class Settings(BaseSettings):
     ENVIRONMENT: str = "development"
     DEB_APIKEY: str
     DEB_SECRETS: str
+    APP_DEB_APIKEY: str = "DAuth-2A9WNniXklWJ2fdFRhlRnyh8x9y829F52mmY55F67AM"
+    APP_DEB_SECRETS: str = "DAuth-Secret-R3AKyZktTSqmazTJcs3fmuqehwAPQC02Fa0P0m-3p8AU4OX7mgzOiBQBMkz0fWx3lTaqGXUEDEuBl75jHHO0qA"
+
+    def get_dauth_credentials(self, is_app: bool = False) -> tuple:
+        if is_app:
+            return self.APP_DEB_APIKEY, self.APP_DEB_SECRETS
+        return self.DEB_APIKEY, self.DEB_SECRETS
     FRONTEND_URL: str = "http://localhost:5173"
     HYPERLOCAL_WEBSITE_URL: str = "http://localhost:5173/auth/callback"
     APP_DEEP_LINK: str = "hyperlocal://auth/callback"

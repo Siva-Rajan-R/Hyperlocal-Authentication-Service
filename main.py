@@ -6,6 +6,9 @@ from infras.db.mongo import MongoDBManager, get_collection
 from core.configs.settings_config import SETTINGS
 import datetime
 from icecream import ic
+import uuid
+import re
+from argon2 import PasswordHasher
 
 async def bootstrap_rsa_keys():
     """Ensure RSA key version '1' exists in MongoDB. Create it if missing."""
@@ -26,6 +29,88 @@ async def bootstrap_rsa_keys():
     })
     ic("RSA key version '1' generated and stored successfully.")
 
+
+async def bootstrap_dev_users():
+    """
+    On initial startup, check if dev allowed users from DEV_ALLOWED_USERS are present in MongoDB:
+    - If a dev user is not present in the DB: create it automatically with the given password.
+    - If already existing: verify if the stored password matches the given password.
+      If different, overwrite it with the given password.
+    - If already existing perfectly with matching password: just ignore.
+    """
+    dev_users = SETTINGS.get_dev_allowed_users()
+    if not dev_users:
+        return
+
+    users_coll = get_collection("users")
+    ph = PasswordHasher()
+
+    for item in dev_users:
+        if not isinstance(item, dict):
+            continue
+        
+        email = (item.get("email") or "").strip().lower()
+        mobilenumber = str(item.get("phone") or item.get("mobilenumber") or "").strip()
+        raw_password = str(item.get("password") or "")
+        
+        if not email and not mobilenumber:
+            continue
+        if not raw_password:
+            continue
+
+        query_or = []
+        if email:
+            query_or.append({"email": email})
+            query_or.append({"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}})
+        if mobilenumber:
+            query_or.append({"mobilenumber": mobilenumber})
+
+        existing_user = await users_coll.find_one({"$or": query_or})
+
+        if not existing_user:
+            name = item.get("name") or (email.split("@")[0].replace(".", " ").title() if email else "Dev User")
+            user_id = str(uuid.uuid4())
+            new_user_doc = {
+                "user_id": user_id,
+                "email": email if email else None,
+                "mobilenumber": mobilenumber if mobilenumber else None,
+                "name": name,
+                "password": ph.hash(raw_password),
+                "has_custom_password": True,
+                "is_temporary_password": False,
+                "two_factor": False,
+                "custom_fields": {"fullname": name},
+                "additional_infos": {},
+                "auth_provider": "password",
+                "created_at": datetime.datetime.utcnow(),
+                "updated_at": datetime.datetime.utcnow()
+            }
+            await users_coll.insert_one(new_user_doc)
+            ic(f"Auto-created dev allowed user in DB: {email or mobilenumber}")
+        else:
+            stored_pwd = existing_user.get("password")
+            password_matches = False
+            if stored_pwd:
+                try:
+                    ph.verify(stored_pwd, raw_password)
+                    password_matches = True
+                except Exception:
+                    password_matches = False
+            
+            if not password_matches:
+                new_hash = ph.hash(raw_password)
+                await users_coll.update_one(
+                    {"_id": existing_user["_id"]},
+                    {"$set": {
+                        "password": new_hash,
+                        "has_custom_password": True,
+                        "updated_at": datetime.datetime.utcnow()
+                    }}
+                )
+                ic(f"Overwrote password for dev allowed user in DB: {email or mobilenumber}")
+            else:
+                ic(f"Dev user already existing and password matched perfectly: {email or mobilenumber}")
+
 from hyperlocal_platform.infras.redis.main import check_redis_health
 
 @asynccontextmanager
@@ -36,6 +121,8 @@ async def lifespan(app: FastAPI):
     await check_redis_health()
     # Bootstrap RSA key version "1" if it doesn't exist
     await bootstrap_rsa_keys()
+    # Bootstrap dev allowed users (auto-create or overwrite password)
+    await bootstrap_dev_users()
     yield
     # Shutdown: Close connections
     await MongoDBManager.disconnect()

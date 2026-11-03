@@ -7,7 +7,7 @@ from fastapi.responses import RedirectResponse, JSONResponse
 import json
 import re
 from pydantic import BaseModel, EmailStr, field_validator
-from typing import Optional, List
+from typing import Optional, List, Any
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
 from icecream import ic
@@ -227,6 +227,36 @@ def is_valid_frontend_redirect_url(url: Optional[str]) -> bool:
             return False
     return True
 
+def is_app_login_request(
+    entity_type: Optional[str] = None,
+    client_type: Optional[str] = None,
+    platform: Optional[str] = None,
+    redirect_url: Optional[str] = None,
+    app: Optional[Any] = None,
+    service: Optional[str] = None
+) -> bool:
+    """Helper to detect if login or signup was requested by mobile app."""
+    if entity_type and str(entity_type).strip().lower() in ("app", "mobile", "application", "android", "ios"):
+        return True
+    if client_type and str(client_type).strip().lower() in ("app", "mobile", "application"):
+        return True
+    if platform and str(platform).strip().lower() in ("app", "mobile", "android", "ios"):
+        return True
+    if app is not None:
+        if isinstance(app, bool) and app:
+            return True
+        if str(app).strip().lower() in ("true", "1", "yes"):
+            return True
+    if service and "APP" in str(service).upper():
+        return True
+    if redirect_url:
+        trimmed = str(redirect_url).strip()
+        if trimmed.startswith("hyperlocal://") or trimmed.startswith("hyperlocal-app://"):
+            return True
+        if "://" in trimmed and not (trimmed.startswith("http://") or trimmed.startswith("https://")):
+            return True
+    return False
+
 @router.get("/login-url")
 @router.get("/signin-url")
 @router.get("/signin/url")
@@ -236,23 +266,40 @@ async def get_login_url(
     version: Optional[str] = Query("1"),
     entity_name: Optional[str] = Query(None),
     entity_type: Optional[str] = Query(None),
+    client_type: Optional[str] = Query(None),
+    platform: Optional[str] = Query(None),
+    app: Optional[str] = Query(None),
     redirect_url: Optional[str] = Query(None),
     verify_url: Optional[str] = Query(None),
     flow_type: Optional[str] = Query("signin")
 ):
+    # Determine if app login was requested
+    is_app = is_app_login_request(
+        entity_type=entity_type,
+        client_type=client_type,
+        platform=platform,
+        redirect_url=redirect_url,
+        app=app,
+        service=service
+    )
+    api_key, _ = SETTINGS.get_dauth_credentials(is_app=is_app)
+    effective_entity_type = entity_type or ("app" if is_app else None)
+
     # Determine unified verify and redirect URLs for signin
     effective_verify_url = SETTINGS.get_verify_url(verify_url)
     backend_redirect_url = SETTINGS.get_signin_redirect_url()
-    frontend_target_url = redirect_url if is_valid_frontend_redirect_url(redirect_url) else None
+    frontend_target_url = redirect_url if (redirect_url and ("://" in redirect_url or is_valid_frontend_redirect_url(redirect_url))) else None
 
     # Connects to Debugger Auth for signin
     constructed_url = f"{DAUTH_BASE_URL}/auth"
     payload = {
-        "apikey": SETTINGS.DEB_APIKEY,
+        "apikey": api_key,
         "flow_type": "signin",
         "additional_infos": {
             "entity_name": entity_name,
-            "entity_type": entity_type,
+            "entity_type": effective_entity_type,
+            "client_type": "app" if is_app else "web",
+            "is_app": is_app,
             "redirect_url": frontend_target_url,
             "service": service,
             "version": version,
@@ -277,7 +324,8 @@ async def get_login_url(
         "service": service,
         "version": version,
         "entity_name": entity_name,
-        "entity_type": entity_type,
+        "entity_type": effective_entity_type,
+        "is_app": is_app,
         "redirect_url": frontend_target_url,
         "verify_url": effective_verify_url,
         "flow_type": "signin"
@@ -289,7 +337,8 @@ async def get_login_url(
         "signup_url": res.get("signup_url"),
         "url": signin_url,
         "verify_url": effective_verify_url,
-        "redirect_url": backend_redirect_url
+        "redirect_url": backend_redirect_url,
+        "is_app": is_app
     }
 
 @router.get("/signup-url")
@@ -300,22 +349,39 @@ async def get_signup_url(
     version: Optional[str] = Query("1"),
     entity_name: Optional[str] = Query(None),
     entity_type: Optional[str] = Query(None),
+    client_type: Optional[str] = Query(None),
+    platform: Optional[str] = Query(None),
+    app: Optional[str] = Query(None),
     redirect_url: Optional[str] = Query(None),
     verify_url: Optional[str] = Query(None)
 ):
+    # Determine if app login was requested
+    is_app = is_app_login_request(
+        entity_type=entity_type,
+        client_type=client_type,
+        platform=platform,
+        redirect_url=redirect_url,
+        app=app,
+        service=service
+    )
+    api_key, _ = SETTINGS.get_dauth_credentials(is_app=is_app)
+    effective_entity_type = entity_type or ("app" if is_app else None)
+
     # Determine unified verify and redirect URLs for signup
     effective_verify_url = SETTINGS.get_verify_url(verify_url)
     backend_redirect_url = SETTINGS.get_signup_redirect_url()
-    frontend_target_url = redirect_url if is_valid_frontend_redirect_url(redirect_url) else None
+    frontend_target_url = redirect_url if (redirect_url and ("://" in redirect_url or is_valid_frontend_redirect_url(redirect_url))) else None
 
     # Connects to Debugger Auth specifically for signup
     constructed_url = f"{DAUTH_BASE_URL}/auth"
     payload = {
-        "apikey": SETTINGS.DEB_APIKEY,
+        "apikey": api_key,
         "flow_type": "signup",
         "additional_infos": {
             "entity_name": entity_name,
-            "entity_type": entity_type,
+            "entity_type": effective_entity_type,
+            "client_type": "app" if is_app else "web",
+            "is_app": is_app,
             "redirect_url": frontend_target_url,
             "service": service,
             "version": version,
@@ -340,7 +406,8 @@ async def get_signup_url(
         "service": service,
         "version": version,
         "entity_name": entity_name,
-        "entity_type": entity_type,
+        "entity_type": effective_entity_type,
+        "is_app": is_app,
         "redirect_url": frontend_target_url,
         "verify_url": effective_verify_url,
         "flow_type": "signup"
@@ -352,7 +419,8 @@ async def get_signup_url(
         "signin_url": res.get("signin_url"),
         "url": signup_url,
         "verify_url": effective_verify_url,
-        "redirect_url": backend_redirect_url
+        "redirect_url": backend_redirect_url,
+        "is_app": is_app
     }
 
 @router.post("/signup")
@@ -894,6 +962,26 @@ async def callback(
     if not version:
         version = "1"
         
+    # Check if app flow from state, query params, or entity_type
+    is_app_flow = False
+    if cookie_state:
+        try:
+            state_dict = json.loads(cookie_state)
+            is_app_flow = bool(state_dict.get("is_app")) or (str(state_dict.get("entity_type") or "").lower() == "app")
+        except Exception:
+            pass
+    if not is_app_flow:
+        is_app_flow = is_app_login_request(
+            entity_type=entity_type or request.query_params.get("entity_type"),
+            client_type=request.query_params.get("client_type"),
+            platform=request.query_params.get("platform"),
+            app=request.query_params.get("app"),
+            service=service or request.query_params.get("service")
+        )
+
+    primary_key, primary_secret = SETTINGS.get_dauth_credentials(is_app=is_app_flow)
+    fallback_key, fallback_secret = SETTINGS.get_dauth_credentials(is_app=not is_app_flow)
+
     # Connects to Debugger Auth to get loggedin user
     constructed_url = f"{DAUTH_BASE_URL}/auth/authenticated-user"
     async with httpx.AsyncClient(timeout=30) as client:
@@ -901,10 +989,22 @@ async def callback(
             constructed_url,
             json={
                 "token_id": token_id,
-                "client_id": SETTINGS.DEB_APIKEY,
-                "client_secret": SETTINGS.DEB_SECRETS
+                "client_id": primary_key,
+                "client_secret": primary_secret
             }
         )
+        if response.status_code != 200 and fallback_key and fallback_key != primary_key:
+            ic("Primary DAuth credentials failed, attempting fallback credentials...")
+            fallback_response = await client.post(
+                constructed_url,
+                json={
+                    "token_id": token_id,
+                    "client_id": fallback_key,
+                    "client_secret": fallback_secret
+                }
+            )
+            if fallback_response.status_code == 200:
+                response = fallback_response
     
     if response.status_code != 200:
         raise HTTPException(
@@ -1188,10 +1288,11 @@ async def callback(
     else:
         srv_upper = service.upper() if service else ""
         ent_lower = entity_type.lower() if entity_type else ""
-        if (srv_upper == "HYPERLOCAL" or srv_upper == "HYPERLOCAL-INVENTORY") and ent_lower == "website":
-            base_redirect_url = SETTINGS.HYPERLOCAL_WEBSITE_URL
-        elif ent_lower == "app":
+        is_app_redirect = bool(is_app_flow or ent_lower == "app" or (additional_infos and (additional_infos.get("is_app") or additional_infos.get("client_type") == "app")))
+        if is_app_redirect:
             base_redirect_url = SETTINGS.APP_DEEP_LINK
+        elif (srv_upper == "HYPERLOCAL" or srv_upper == "HYPERLOCAL-INVENTORY") and ent_lower == "website":
+            base_redirect_url = SETTINGS.HYPERLOCAL_WEBSITE_URL
         else:
             base_redirect_url = f"{SETTINGS.FRONTEND_URL}/auth/callback"
 
