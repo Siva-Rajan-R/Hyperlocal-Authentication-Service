@@ -133,6 +133,24 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://shopiq.inventq.in",
+        "http://shopiq.inventq.in",
+        "https://app.inventq.in",
+        "https://dev.app.inventq.in",
+        "http://localhost:5173",
+        "http://localhost:5175",
+        "*"
+    ],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 app.include_router(auth_routes.router)
 
 from fastapi.responses import RedirectResponse
@@ -142,8 +160,14 @@ from urllib.parse import quote
 async def root_fallback(request: Request):
     error = request.query_params.get("error")
     if error:
-        frontend_url = SETTINGS.FRONTEND_URL or "http://localhost:5173"
-        return RedirectResponse(url=f"{frontend_url}/auth/callback?error={quote(str(error))}")
+        is_app = auth_routes.is_app_login_request(
+            entity_type=request.query_params.get("entity_type"),
+            client_type=request.query_params.get("client_type"),
+            service=request.query_params.get("service")
+        )
+        target_base = SETTINGS.APP_DEEP_LINK if is_app else (f"{SETTINGS.FRONTEND_URL}/auth/callback" if SETTINGS.FRONTEND_URL else "https://shopiq.inventq.in/callback")
+        sep = "&" if "?" in target_base else "?"
+        return RedirectResponse(url=f"{target_base}{sep}error={quote(str(error))}")
     return {"service": "Authentication-Service", "status": "running"}
 
 @app.api_route("/signin/verify", methods=["GET", "POST", "OPTIONS", "HEAD"])

@@ -209,6 +209,10 @@ async def get_public_key(version: str):
 def is_valid_frontend_redirect_url(url: Optional[str]) -> bool:
     if not url or not isinstance(url, str):
         return False
+    trimmed = str(url).strip()
+    # App deep links and shopiq URLs are always valid frontend targets
+    if "shopiq.inventq.in" in trimmed or trimmed.startswith("hyperlocal://") or trimmed.startswith("hyperlocal-app://") or trimmed.startswith("shopiq://"):
+        return True
     # If the URL points to backend/gateway auth redirect/verify endpoints, it is NOT a valid frontend URL
     blocked_endpoints = [
         "/auth/signin/redirect",
@@ -251,7 +255,9 @@ def is_app_login_request(
         return True
     if redirect_url:
         trimmed = str(redirect_url).strip()
-        if trimmed.startswith("hyperlocal://") or trimmed.startswith("hyperlocal-app://"):
+        if trimmed.startswith("hyperlocal://") or trimmed.startswith("hyperlocal-app://") or trimmed.startswith("shopiq://"):
+            return True
+        if "shopiq.inventq.in" in trimmed:
             return True
         if "://" in trimmed and not (trimmed.startswith("http://") or trimmed.startswith("https://")):
             return True
@@ -289,6 +295,8 @@ async def get_login_url(
     effective_verify_url = SETTINGS.get_verify_url(verify_url)
     backend_redirect_url = SETTINGS.get_signin_redirect_url()
     frontend_target_url = redirect_url if (redirect_url and ("://" in redirect_url or is_valid_frontend_redirect_url(redirect_url))) else None
+    if not frontend_target_url and is_app:
+        frontend_target_url = SETTINGS.APP_DEEP_LINK
 
     # Connects to Debugger Auth for signin
     constructed_url = f"{DAUTH_BASE_URL}/auth"
@@ -371,6 +379,8 @@ async def get_signup_url(
     effective_verify_url = SETTINGS.get_verify_url(verify_url)
     backend_redirect_url = SETTINGS.get_signup_redirect_url()
     frontend_target_url = redirect_url if (redirect_url and ("://" in redirect_url or is_valid_frontend_redirect_url(redirect_url))) else None
+    if not frontend_target_url and is_app:
+        frontend_target_url = SETTINGS.APP_DEEP_LINK
 
     # Connects to Debugger Auth specifically for signup
     constructed_url = f"{DAUTH_BASE_URL}/auth"

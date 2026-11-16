@@ -17,7 +17,7 @@ class Settings(BaseSettings):
         return self.DEB_APIKEY, self.DEB_SECRETS
     FRONTEND_URL: str = "http://localhost:5173"
     HYPERLOCAL_WEBSITE_URL: str = "http://localhost:5173/auth/callback"
-    APP_DEEP_LINK: str = "hyperlocal://auth/callback"
+    APP_DEEP_LINK: str = os.getenv("APP_DEEP_LINK", "https://shopiq.inventq.in/callback")
     BACKEND_URL: str = os.getenv("BACKEND_URL") or os.getenv("AUTH_SERVICE_PUBLIC_URL") or "http://127.0.0.1:8010"
     GATEWAY_URL: str = os.getenv("GATEWAY_URL") or "http://127.0.0.1:8000"
 
