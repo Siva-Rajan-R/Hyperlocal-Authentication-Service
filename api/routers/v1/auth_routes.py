@@ -21,7 +21,19 @@ from infras.db.mongo import get_collection
 from dotenv import load_dotenv
 load_dotenv()
 from hyperlocal_platform.infras.redis.main import redis_client
-from core.utils.email_helper import generate_secure_random_password, send_account_credentials_email
+from core.utils.email_helper import generate_secure_random_password, send_account_credentials_email, send_account_deletion_otp_email, send_shopiq_welcome_email
+
+# Account Deletion Schemas
+class RequestAccountDeletionOtpSchema(BaseModel):
+    user_id: Optional[str] = None
+    email: Optional[str] = None
+    scope: Optional[str] = "shopiq"
+
+class VerifyAccountDeletionOtpSchema(BaseModel):
+    user_id: Optional[str] = None
+    email: Optional[str] = None
+    otp: str
+    scope: Optional[str] = "shopiq"
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 ph = PasswordHasher()
@@ -231,15 +243,23 @@ def is_valid_frontend_redirect_url(url: Optional[str]) -> bool:
             return False
     return True
 
+KNOWN_APP_DEB_APIKEYS = {
+    "DAuth-P-4RzbzRX7pO_oyhX4jypZMbkfN6qDdR8FZUkAhXkQM",
+    "DAuth-2A9WNniXklWJ2fdFRhlRnyh8x9y829F52mmY55F67AM"
+}
+
 def is_app_login_request(
     entity_type: Optional[str] = None,
     client_type: Optional[str] = None,
     platform: Optional[str] = None,
     redirect_url: Optional[str] = None,
     app: Optional[Any] = None,
-    service: Optional[str] = None
+    service: Optional[str] = None,
+    api_key: Optional[str] = None
 ) -> bool:
     """Helper to detect if login or signup was requested by mobile app."""
+    if api_key and (api_key == SETTINGS.APP_DEB_APIKEY or api_key in KNOWN_APP_DEB_APIKEYS):
+        return True
     if entity_type and str(entity_type).strip().lower() in ("app", "mobile", "application", "android", "ios"):
         return True
     if client_type and str(client_type).strip().lower() in ("app", "mobile", "application"):
@@ -263,6 +283,105 @@ def is_app_login_request(
             return True
     return False
 
+def check_is_app(request: Optional[Request] = None, body: Optional[dict] = None) -> bool:
+    """
+    Comprehensive detector to verify if an incoming request originated from the ShopiQ mobile app.
+    Checks:
+    - Route URL path (/app/)
+    - Request Query parameters (is_app, entity_type, client_type, platform, service, redirect_url)
+    - Request Headers (x-api-key, apikey, client-id, x-client-type, x-entity-type, referer, origin)
+    - Cookie oauth_state (is_app, entity_type)
+    - Body fields & nested additional_infos/custom_fields
+    - Known App DAuth API keys
+    """
+    app_keys = {
+        SETTINGS.APP_DEB_APIKEY,
+        *KNOWN_APP_DEB_APIKEYS
+    }
+    
+    if request:
+        try:
+            path = request.url.path.lower()
+            if "/app/" in path or path.endswith("/app"):
+                return True
+        except Exception:
+            pass
+
+        # Check query parameters
+        try:
+            for k, v in request.query_params.items():
+                k_low = k.lower()
+                v_str = str(v).strip().lower()
+                if k_low in ("is_app", "app") and v_str in ("true", "1", "yes"):
+                    return True
+                if k_low in ("entity_type", "client_type", "platform") and v_str in ("app", "mobile", "application", "android", "ios"):
+                    return True
+                if k_low == "service" and "APP" in str(v).upper():
+                    return True
+                if k_low in ("redirect_url", "url") and ("shopiq" in v_str or "hyperlocal://" in v_str or "hyperlocal-app://" in v_str):
+                    return True
+                if k_low in ("apikey", "client_id", "api_key") and v in app_keys:
+                    return True
+        except Exception:
+            pass
+
+        # Check headers
+        try:
+            for hdr_name in ("x-api-key", "apikey", "client-id", "x-dauth-apikey"):
+                hdr_val = request.headers.get(hdr_name)
+                if hdr_val and hdr_val in app_keys:
+                    return True
+            if request.headers.get("x-client-type", "").lower() in ("app", "mobile"):
+                return True
+            if request.headers.get("x-entity-type", "").lower() in ("app", "mobile"):
+                return True
+            referer = request.headers.get("referer", "").lower()
+            if "shopiq" in referer or "hyperlocal" in referer:
+                return True
+        except Exception:
+            pass
+
+        # Check oauth_state cookie
+        try:
+            cookie_state = request.cookies.get("oauth_state")
+            if cookie_state:
+                st = json.loads(cookie_state)
+                if bool(st.get("is_app")) or str(st.get("entity_type") or "").lower() == "app" or str(st.get("client_type") or "").lower() == "app" or "APP" in str(st.get("service") or "").upper():
+                    return True
+        except Exception:
+            pass
+
+    if body and isinstance(body, dict):
+        if body.get("is_app") is True or str(body.get("is_app")).lower() in ("true", "1", "yes"):
+            return True
+        b_key = body.get("apikey") or body.get("client_id") or body.get("api_key")
+        if b_key and b_key in app_keys:
+            return True
+            
+        additional = body.get("additional_infos") if isinstance(body.get("additional_infos"), dict) else {}
+        if additional.get("is_app") is True or str(additional.get("is_app")).lower() in ("true", "1", "yes"):
+            return True
+        add_key = additional.get("apikey") or additional.get("client_id")
+        if add_key and add_key in app_keys:
+            return True
+
+        custom = body.get("custom_fields") if isinstance(body.get("custom_fields"), dict) else {}
+
+        for source in (body, additional, custom):
+            if not isinstance(source, dict):
+                continue
+            ent = str(source.get("entity_type") or "").strip().lower()
+            cli = str(source.get("client_type") or "").strip().lower()
+            plt = str(source.get("platform") or "").strip().lower()
+            app_val = source.get("app")
+            srv = str(source.get("service") or "").upper()
+            red = str(source.get("redirect_url") or "")
+            b_key_src = source.get("apikey") or source.get("client_id")
+            if is_app_login_request(entity_type=ent, client_type=cli, platform=plt, redirect_url=red, app=app_val, service=srv, api_key=b_key_src):
+                return True
+
+    return False
+
 @router.get("/login-url")
 @router.get("/signin-url")
 @router.get("/signin/url")
@@ -277,7 +396,8 @@ async def get_login_url(
     app: Optional[str] = Query(None),
     redirect_url: Optional[str] = Query(None),
     verify_url: Optional[str] = Query(None),
-    flow_type: Optional[str] = Query("signin")
+    flow_type: Optional[str] = Query("signin"),
+    temp_id: Optional[str] = Query(None)
 ):
     # Determine if app login was requested
     is_app = is_app_login_request(
@@ -291,9 +411,39 @@ async def get_login_url(
     api_key, _ = SETTINGS.get_dauth_credentials(is_app=is_app)
     effective_entity_type = entity_type or ("app" if is_app else None)
 
+    # Generate unique temporary polling ticket ID if not provided (5 minutes expiry)
+    effective_temp_id = (temp_id or str(uuid.uuid4())).strip()
+    poll_redis_key = f"auth_poll:{effective_temp_id}"
+    try:
+        await redis_client.set(
+            poll_redis_key,
+            json.dumps({
+                "status": "pending",
+                "temp_id": effective_temp_id,
+                "service": service,
+                "version": version,
+                "is_app": is_app,
+                "flow_type": flow_type or "signin",
+                "created_at": datetime.datetime.utcnow().isoformat()
+            }),
+            ex=300
+        )
+    except Exception as redis_err:
+        ic(f"Failed to record auth_poll pending status in Redis: {redis_err}")
+
     # Determine unified verify and redirect URLs for signin
-    effective_verify_url = SETTINGS.get_verify_url(verify_url)
+    effective_verify_url = SETTINGS.get_app_verify_url(verify_url) if is_app else SETTINGS.get_verify_url(verify_url)
     backend_redirect_url = SETTINGS.get_signin_redirect_url()
+    if is_app:
+        sep_v = "&" if "?" in effective_verify_url else "?"
+        effective_verify_url = f"{effective_verify_url}{sep_v}is_app=true&client_type=app&entity_type=app&service={service or 'HYPERLOCAL_APP'}"
+        sep_r = "&" if "?" in backend_redirect_url else "?"
+        backend_redirect_url = f"{backend_redirect_url}{sep_r}is_app=true&client_type=app&entity_type=app&service={service or 'HYPERLOCAL_APP'}"
+
+    # Append temp_id to backend redirect URL so callback can map tokens
+    sep_t = "&" if "?" in backend_redirect_url else "?"
+    backend_redirect_url = f"{backend_redirect_url}{sep_t}temp_id={effective_temp_id}"
+
     frontend_target_url = redirect_url if (redirect_url and ("://" in redirect_url or is_valid_frontend_redirect_url(redirect_url))) else None
     if not frontend_target_url and is_app:
         frontend_target_url = SETTINGS.APP_DEEP_LINK
@@ -302,7 +452,10 @@ async def get_login_url(
     constructed_url = f"{DAUTH_BASE_URL}/auth"
     payload = {
         "apikey": api_key,
-        "flow_type": "signin",
+        "flow_type": flow_type or "signin",
+        "verify_url": effective_verify_url,
+        "redirect_url": backend_redirect_url,
+        "callback_url": backend_redirect_url,
         "additional_infos": {
             "entity_name": entity_name,
             "entity_type": effective_entity_type,
@@ -311,7 +464,10 @@ async def get_login_url(
             "redirect_url": frontend_target_url,
             "service": service,
             "version": version,
-            "flow_type": "signin"
+            "flow_type": flow_type or "signin",
+            "verify_url": effective_verify_url,
+            "backend_redirect_url": backend_redirect_url,
+            "temp_id": effective_temp_id
         }
     }
     async with httpx.AsyncClient(timeout=30) as client:
@@ -336,7 +492,8 @@ async def get_login_url(
         "is_app": is_app,
         "redirect_url": frontend_target_url,
         "verify_url": effective_verify_url,
-        "flow_type": "signin"
+        "flow_type": flow_type or "signin",
+        "temp_id": effective_temp_id
     })
     response.set_cookie(key="oauth_state", value=state_val, max_age=900, samesite="lax")
     signin_url = res.get("signin_url") or res.get("url")
@@ -346,7 +503,9 @@ async def get_login_url(
         "url": signin_url,
         "verify_url": effective_verify_url,
         "redirect_url": backend_redirect_url,
-        "is_app": is_app
+        "is_app": is_app,
+        "temp_id": effective_temp_id,
+        "expires_in": 300
     }
 
 @router.get("/signup-url")
@@ -361,7 +520,8 @@ async def get_signup_url(
     platform: Optional[str] = Query(None),
     app: Optional[str] = Query(None),
     redirect_url: Optional[str] = Query(None),
-    verify_url: Optional[str] = Query(None)
+    verify_url: Optional[str] = Query(None),
+    temp_id: Optional[str] = Query(None)
 ):
     # Determine if app login was requested
     is_app = is_app_login_request(
@@ -375,9 +535,39 @@ async def get_signup_url(
     api_key, _ = SETTINGS.get_dauth_credentials(is_app=is_app)
     effective_entity_type = entity_type or ("app" if is_app else None)
 
+    # Generate unique temporary polling ticket ID if not provided (5 minutes expiry)
+    effective_temp_id = (temp_id or str(uuid.uuid4())).strip()
+    poll_redis_key = f"auth_poll:{effective_temp_id}"
+    try:
+        await redis_client.set(
+            poll_redis_key,
+            json.dumps({
+                "status": "pending",
+                "temp_id": effective_temp_id,
+                "service": service,
+                "version": version,
+                "is_app": is_app,
+                "flow_type": "signup",
+                "created_at": datetime.datetime.utcnow().isoformat()
+            }),
+            ex=300
+        )
+    except Exception as redis_err:
+        ic(f"Failed to record auth_poll pending status in Redis: {redis_err}")
+
     # Determine unified verify and redirect URLs for signup
-    effective_verify_url = SETTINGS.get_verify_url(verify_url)
+    effective_verify_url = SETTINGS.get_app_verify_url(verify_url) if is_app else SETTINGS.get_verify_url(verify_url)
     backend_redirect_url = SETTINGS.get_signup_redirect_url()
+    if is_app:
+        sep_v = "&" if "?" in effective_verify_url else "?"
+        effective_verify_url = f"{effective_verify_url}{sep_v}is_app=true&client_type=app&entity_type=app&service={service or 'HYPERLOCAL_APP'}"
+        sep_r = "&" if "?" in backend_redirect_url else "?"
+        backend_redirect_url = f"{backend_redirect_url}{sep_r}is_app=true&client_type=app&entity_type=app&service={service or 'HYPERLOCAL_APP'}"
+
+    # Append temp_id to backend redirect URL so callback can map tokens
+    sep_t = "&" if "?" in backend_redirect_url else "?"
+    backend_redirect_url = f"{backend_redirect_url}{sep_t}temp_id={effective_temp_id}"
+
     frontend_target_url = redirect_url if (redirect_url and ("://" in redirect_url or is_valid_frontend_redirect_url(redirect_url))) else None
     if not frontend_target_url and is_app:
         frontend_target_url = SETTINGS.APP_DEEP_LINK
@@ -387,6 +577,9 @@ async def get_signup_url(
     payload = {
         "apikey": api_key,
         "flow_type": "signup",
+        "verify_url": effective_verify_url,
+        "redirect_url": backend_redirect_url,
+        "callback_url": backend_redirect_url,
         "additional_infos": {
             "entity_name": entity_name,
             "entity_type": effective_entity_type,
@@ -395,7 +588,10 @@ async def get_signup_url(
             "redirect_url": frontend_target_url,
             "service": service,
             "version": version,
-            "flow_type": "signup"
+            "flow_type": "signup",
+            "verify_url": effective_verify_url,
+            "backend_redirect_url": backend_redirect_url,
+            "temp_id": effective_temp_id
         }
     }
     async with httpx.AsyncClient(timeout=30) as client:
@@ -420,7 +616,8 @@ async def get_signup_url(
         "is_app": is_app,
         "redirect_url": frontend_target_url,
         "verify_url": effective_verify_url,
-        "flow_type": "signup"
+        "flow_type": "signup",
+        "temp_id": effective_temp_id
     })
     response.set_cookie(key="oauth_state", value=state_val, max_age=900, samesite="lax")
     signup_url = res.get("signup_url") or res.get("signin_url") or res.get("url")
@@ -430,7 +627,9 @@ async def get_signup_url(
         "url": signup_url,
         "verify_url": effective_verify_url,
         "redirect_url": backend_redirect_url,
-        "is_app": is_app
+        "is_app": is_app,
+        "temp_id": effective_temp_id,
+        "expires_in": 300
     }
 
 @router.post("/signup")
@@ -485,16 +684,28 @@ async def signup_direct(data: SignupRequestSchema):
     }
     await users_coll.insert_one(user_doc)
     
-    email_sent = await send_account_credentials_email(
-        email=clean_email,
-        name=name,
-        password=raw_password,
-        login_url=f"{SETTINGS.FRONTEND_URL}/login"
+    is_shopiq = bool(
+        data.additional_infos and (
+            data.additional_infos.get("is_app")
+            or str(data.additional_infos.get("client_type") or "").lower() in ("app", "mobile")
+            or str(data.additional_infos.get("service") or "").upper() in ("HYPERLOCAL_APP", "DIGITAL_STORE", "SHOPIQ")
+        )
     )
+    if is_shopiq:
+        email_sent = await send_shopiq_welcome_email(email=clean_email, name=name)
+        ret_msg = "Welcome to ShopiQ! Your account has been created successfully."
+    else:
+        email_sent = await send_account_credentials_email(
+            email=clean_email,
+            name=name,
+            password=raw_password,
+            login_url=f"{SETTINGS.FRONTEND_URL}/login"
+        )
+        ret_msg = "Account created successfully! Your login password has been sent to your email."
     
     return {
         "success": True,
-        "message": "Account created successfully! Your login password has been sent to your email.",
+        "message": ret_msg,
         "user_id": user_id,
         "email": clean_email,
         "email_sent": email_sent
@@ -576,12 +787,17 @@ def _parse_identifiers(body: dict):
 @router.api_route("/signin/verify", methods=["GET", "POST", "OPTIONS", "HEAD"])
 @router.api_route("/signin/callback/verify", methods=["GET", "POST", "OPTIONS", "HEAD"])
 @router.api_route("/login/verify", methods=["GET", "POST", "OPTIONS", "HEAD"])
+@router.api_route("/app/verify", methods=["GET", "POST", "OPTIONS", "HEAD"])
+@router.api_route("/app/signin/verify", methods=["GET", "POST", "OPTIONS", "HEAD"])
+@router.api_route("/app/login/verify", methods=["GET", "POST", "OPTIONS", "HEAD"])
 async def signin_verify(request: Request):
     """
     Dedicated Sign-In Verification route with Sign-In specific validation:
     - Supports GET, POST, OPTIONS, HEAD.
     - If ping or healthcheck: returns 200 OK.
-    - Verifies user MUST exist in DB. Rejects with 404 if not registered.
+    - For ShopiQ Mobile App users (is_app is True): Auto-provisioning is enabled!
+      New users are allowed to authenticate without 404 rejection.
+    - For Web users: Verifies user MUST exist in DB. Rejects with 404 if not registered.
     - Validates password (Argon2) if provided. Rejects with 401 if invalid.
     """
     if request.method == "OPTIONS":
@@ -590,6 +806,7 @@ async def signin_verify(request: Request):
     body = await _extract_verify_payload(request)
     ic("signin/verify request received:", request.method, body)
     
+    is_app = check_is_app(request=request, body=body)
     email, mobilenumber, password, auth_provider = _parse_identifiers(body)
 
     # Healthcheck / ping handler
@@ -625,9 +842,9 @@ async def signin_verify(request: Request):
             }
         )
     
-    # Dev environment access check (enforced when ENVIRONMENT != 'production')
-    if SETTINGS.ENVIRONMENT.lower() != "production":
-        is_allowed, dev_err = SETTINGS.is_dev_allowed(email=email, password=password if auth_provider == "password" else None, mobilenumber=mobilenumber)
+    # Dev environment access check (enforced when ENVIRONMENT != 'production' and NOT an app request)
+    if SETTINGS.ENVIRONMENT.lower() != "production" and not is_app:
+        is_allowed, dev_err = SETTINGS.is_dev_allowed(email=email, password=password if auth_provider == "password" else None, mobilenumber=mobilenumber, is_app=is_app)
         if not is_allowed:
             return JSONResponse(
                 status_code=403,
@@ -648,10 +865,28 @@ async def signin_verify(request: Request):
     if mobilenumber:
         query_or.append({"mobilenumber": mobilenumber})
         
-    user_doc = await users_coll.find_one({"$or": query_or})
+    user_doc = await users_coll.find_one({"$or": query_or, "is_deleted": {"$ne": True}})
     
-    # Sign-in validation: Account MUST exist!
+    # Sign-in validation:
     if not user_doc:
+        if is_app:
+            # ShopiQ mobile app: auto-provisioning is enabled!
+            # Allow new users to proceed with OTP verification without failing "Account not found"!
+            ic(f"ShopiQ app user {email or mobilenumber} not found in DB - approving sign-in for auto-provisioning.")
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "success": True,
+                    "status": "success",
+                    "status_code": 200,
+                    "verified": True,
+                    "is_app": True,
+                    "is_new_user": True,
+                    "message": "ShopiQ app user verified. Account will be auto-provisioned upon login.",
+                    "email": email,
+                    "mobilenumber": mobilenumber
+                }
+            )
         return JSONResponse(
             status_code=404,
             content={
@@ -700,12 +935,13 @@ async def signin_verify(request: Request):
 
 @router.api_route("/signup/verify", methods=["GET", "POST", "OPTIONS", "HEAD"])
 @router.api_route("/callback/signup/verify", methods=["GET", "POST", "OPTIONS", "HEAD"])
+@router.api_route("/app/signup/verify", methods=["GET", "POST", "OPTIONS", "HEAD"])
 async def signup_verify(request: Request):
     """
     Dedicated Sign-Up Verification route with Sign-Up specific validation:
     - Supports GET, POST, OPTIONS, HEAD.
     - If ping or healthcheck: returns 200 OK.
-    - Verifies user MUST NOT exist in DB. Rejects with 409 if already registered.
+    - Verifies user MUST NOT exist in DB. Rejects with 409 if already registered (unless is_app).
     - Allows new registrations to proceed.
     """
     if request.method == "OPTIONS":
@@ -714,6 +950,7 @@ async def signup_verify(request: Request):
     body = await _extract_verify_payload(request)
     ic("signup/verify request received:", request.method, body)
     
+    is_app = check_is_app(request=request, body=body)
     email, mobilenumber, _, _ = _parse_identifiers(body)
 
     # Healthcheck / ping handler
@@ -760,9 +997,9 @@ async def signup_verify(request: Request):
             }
         )
 
-    # Dev environment access check (enforced when ENVIRONMENT != 'production')
-    if SETTINGS.ENVIRONMENT.lower() != "production":
-        is_allowed, dev_err = SETTINGS.is_dev_allowed(email=email, mobilenumber=mobilenumber)
+    # Dev environment access check (enforced when ENVIRONMENT != 'production' and NOT an app request)
+    if SETTINGS.ENVIRONMENT.lower() != "production" and not is_app:
+        is_allowed, dev_err = SETTINGS.is_dev_allowed(email=email, mobilenumber=mobilenumber, is_app=is_app)
         if not is_allowed:
             return JSONResponse(
                 status_code=403,
@@ -783,10 +1020,25 @@ async def signup_verify(request: Request):
     if mobilenumber:
         query_or.append({"mobilenumber": mobilenumber})
         
-    user_doc = await users_coll.find_one({"$or": query_or})
+    user_doc = await users_coll.find_one({"$or": query_or, "is_deleted": {"$ne": True}})
     
-    # Sign-up validation: Account MUST NOT exist!
+    # Sign-up validation: Account MUST NOT exist! (Except for ShopiQ app where existing users are allowed)
     if user_doc:
+        if is_app:
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "success": True,
+                    "status": "success",
+                    "status_code": 200,
+                    "verified": True,
+                    "is_app": True,
+                    "message": "ShopiQ app user already registered, allowed to proceed.",
+                    "user_id": user_doc.get("user_id"),
+                    "email": user_doc.get("email"),
+                    "mobilenumber": user_doc.get("mobilenumber")
+                }
+            )
         return JSONResponse(
             status_code=409,
             content={
@@ -842,11 +1094,23 @@ async def callback_verify(request: Request):
 async def callback(
     request: Request,
     token_id: Optional[str] = Query(None),
+    temp_id: Optional[str] = Query(None),
     error: Optional[str] = Query(None),
     status_code: Optional[int] = Query(None),
     service: Optional[str] = Query(None),
     version: Optional[str] = Query(None)
 ):
+    if not isinstance(error, str):
+        error = None
+    if not isinstance(status_code, int):
+        status_code = None
+    if not isinstance(service, str):
+        service = None
+    if not isinstance(version, str):
+        version = None
+    if not isinstance(token_id, str):
+        token_id = None
+
     path = request.url.path
     detected_flow = "signup" if ("signup" in path) else "signin"
 
@@ -884,6 +1148,23 @@ async def callback(
     # 1. Check if token_id is a login_id stored in Redis
     redis_key = f"login_id:{token_id}"
     stored_payload_json = await redis_client.get(redis_key)
+    if not stored_payload_json:
+        # Check if token_id is actually a temp_id in auth_poll
+        poll_check_key = f"auth_poll:{token_id}"
+        poll_check_json = await redis_client.get(poll_check_key)
+        if poll_check_json:
+            try:
+                poll_check_data = json.loads(poll_check_json)
+                if poll_check_data.get("status") == "authenticated":
+                    return {
+                        "access_token": poll_check_data.get("access_token"),
+                        "refresh_token": poll_check_data.get("refresh_token"),
+                        "token_type": poll_check_data.get("token_type", "bearer"),
+                        "expires_in": poll_check_data.get("expires_in", 3600)
+                    }
+            except Exception:
+                pass
+
     if stored_payload_json:
         # This is a frontend exchange request!
         payload = json.loads(stored_payload_json)
@@ -953,6 +1234,7 @@ async def callback(
     entity_type = None
     redirect_url_param = None
     flow_type = None
+    cookie_temp_id = None
     if cookie_state:
         try:
             state_data = json.loads(cookie_state)
@@ -964,6 +1246,7 @@ async def callback(
             entity_type = state_data.get("entity_type")
             redirect_url_param = state_data.get("redirect_url")
             flow_type = state_data.get("flow_type")
+            cookie_temp_id = state_data.get("temp_id")
         except Exception:
             pass
             
@@ -973,8 +1256,8 @@ async def callback(
         version = "1"
         
     # Check if app flow from state, query params, or entity_type
-    is_app_flow = False
-    if cookie_state:
+    is_app_flow = check_is_app(request=request)
+    if not is_app_flow and cookie_state:
         try:
             state_dict = json.loads(cookie_state)
             is_app_flow = bool(state_dict.get("is_app")) or (str(state_dict.get("entity_type") or "").lower() == "app")
@@ -1044,6 +1327,11 @@ async def callback(
         service = additional_infos.get("service")
     if additional_infos.get("version"):
         version = additional_infos.get("version")
+    if not is_app_flow:
+        is_app_flow = check_is_app(
+            request=request,
+            body={"additional_infos": additional_infos, "custom_fields": custom_fields}
+        )
     if not flow_type:
         flow_type = (
             additional_infos.get("flow_type")
@@ -1061,7 +1349,7 @@ async def callback(
         mobilenumber = mobilenumber.strip()
     
     users_coll = get_collection("users")
-    user_query = {}
+    user_query = {"is_deleted": {"$ne": True}}
     if email:
         user_query["$or"] = [
             {"email": email},
@@ -1075,8 +1363,9 @@ async def callback(
         user_doc = await users_coll.find_one(user_query)
         
     # Dev environment access check (only pre-configured dev users can access when not production)
-    if SETTINGS.ENVIRONMENT.lower() != "production":
-        is_allowed, dev_err = SETTINGS.is_dev_allowed(email=email, mobilenumber=mobilenumber)
+    # Mobile app users are exempt from dev restriction check
+    if SETTINGS.ENVIRONMENT.lower() != "production" and not is_app_flow:
+        is_allowed, dev_err = SETTINGS.is_dev_allowed(email=email, mobilenumber=mobilenumber, is_app=is_app_flow)
         if not is_allowed:
             from urllib.parse import quote
             base_redirect_url = redirect_url_param or f"{SETTINGS.FRONTEND_URL}/login"
@@ -1118,15 +1407,19 @@ async def callback(
 
     is_signup_flow = bool(flow_type == "signup" or deb_user_info.get("action") == "signup" or deb_user_info.get("event") == "signup")
 
-    # If Signin flow and user NOT present: reject and redirect to signup!
+    # If Signin flow and user NOT present: reject and redirect to signup EXCEPT for ShopiQ app users!
     if not is_signup_flow and not user_doc:
-        from urllib.parse import quote
-        base_redirect_url = redirect_url_param or f"{SETTINGS.FRONTEND_URL}/login"
-        sep = "&" if "?" in base_redirect_url else "?"
-        err_msg = "Account not found. Please sign up to create an account."
-        return RedirectResponse(url=f"{base_redirect_url}{sep}error={quote(err_msg)}&status_code=404&flow=signup")
+        if not is_app_flow:
+            from urllib.parse import quote
+            base_redirect_url = redirect_url_param or f"{SETTINGS.FRONTEND_URL}/login"
+            sep = "&" if "?" in base_redirect_url else "?"
+            err_msg = "Account not found. Please sign up to create an account."
+            return RedirectResponse(url=f"{base_redirect_url}{sep}error={quote(err_msg)}&status_code=404&flow=signup")
+        else:
+            ic("Auto-provisioning new account for ShopiQ mobile app user:", email or mobilenumber)
 
-    # If Signup flow and user NOT present: create new account, generate password, email it!
+    # If user NOT present in DB (Signup flow OR ShopiQ app auto-provisioning):
+    # create new account, generate password, email it!
     if not user_doc:
         user_id = deb_user_info.get("user_id") or deb_user_info.get("id") or str(uuid.uuid4())
         
@@ -1162,14 +1455,38 @@ async def callback(
             
         await users_coll.insert_one(user_doc)
         
-        # Send generated credentials via email
+        # Send welcome email based on client type (ShopiQ customer vs inventQ retailer)
         if email:
-            await send_account_credentials_email(
-                email=email,
-                name=name,
-                password=generated_password,
-                login_url=f"{SETTINGS.FRONTEND_URL}/login"
+            is_shopiq_customer = bool(
+                is_app_flow
+                or str(entity_type or "").lower() in ("app", "mobile")
+                or str(service or "").upper() in ("HYPERLOCAL_APP", "DIGITAL_STORE", "SHOPIQ")
+                or (additional_infos and (
+                    additional_infos.get("is_app")
+                    or str(additional_infos.get("client_type") or "").lower() in ("app", "mobile")
+                    or str(additional_infos.get("entity_type") or "").lower() in ("app", "mobile")
+                    or str(additional_infos.get("service") or "").upper() in ("HYPERLOCAL_APP", "DIGITAL_STORE", "SHOPIQ")
+                ))
+                or (effective_temp_id)
             )
+
+            try:
+                if is_shopiq_customer:
+                    # ShopiQ customer: send friendly welcome message ONLY (no temporary password or inventQ credentials)
+                    await send_shopiq_welcome_email(
+                        email=email,
+                        name=name
+                    )
+                else:
+                    # inventQ retail/staff platform user: send credentials email
+                    await send_account_credentials_email(
+                        email=email,
+                        name=name,
+                        password=generated_password,
+                        login_url=f"{SETTINGS.FRONTEND_URL}/login"
+                    )
+            except Exception as mail_err:
+                ic(f"Failed to send welcome email: {mail_err}")
     else:
         user_id = user_doc["user_id"]
         email = user_doc.get("email") or email
@@ -1283,6 +1600,78 @@ async def callback(
     }
     
     await redis_client.set(new_redis_key, json.dumps(user_context), ex=120)
+
+    # Resolve effective_temp_id for polling mapping
+    effective_temp_id = (
+        temp_id
+        or request.query_params.get("temp_id")
+        or (additional_infos.get("temp_id") if isinstance(additional_infos, dict) else None)
+        or cookie_temp_id
+    )
+
+    # Pre-generate JWT access & refresh tokens for polling clients (ShopiQ) and store in Redis
+    try:
+        private_key_pem, _ = await get_keys_for_version(version)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        access_jti = str(uuid.uuid4())
+        access_exp = now + datetime.timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        access_payload = {
+            "sub": user_id,
+            "user_id": user_id,
+            "service_name": service,
+            "type": "access",
+            "version": version,
+            "exp": int(access_exp.timestamp()),
+            "jti": access_jti,
+            "email": email,
+            "mobilenumber": mobilenumber
+        }
+        if entity_name:
+            access_payload["entity_name"] = entity_name
+        if entity_type:
+            access_payload["entity_type"] = entity_type
+
+        refresh_jti = str(uuid.uuid4())
+        refresh_exp = now + datetime.timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+        refresh_payload = {
+            "sub": user_id,
+            "user_id": user_id,
+            "service_name": service,
+            "type": "refresh",
+            "version": version,
+            "exp": int(refresh_exp.timestamp()),
+            "jti": refresh_jti,
+            "email": email,
+            "mobilenumber": mobilenumber
+        }
+        if entity_name:
+            refresh_payload["entity_name"] = entity_name
+        if entity_type:
+            refresh_payload["entity_type"] = entity_type
+
+        access_token = jwt.encode(access_payload, private_key_pem, algorithm="RS256")
+        refresh_token = jwt.encode(refresh_payload, private_key_pem, algorithm="RS256")
+
+        if effective_temp_id:
+            poll_redis_key = f"auth_poll:{effective_temp_id}"
+            poll_payload = {
+                "status": "authenticated",
+                "temp_id": effective_temp_id,
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+                "token_type": "bearer",
+                "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+                "user_id": user_id,
+                "email": email,
+                "mobilenumber": mobilenumber,
+                "service": service,
+                "version": version,
+                "authenticated_at": datetime.datetime.utcnow().isoformat()
+            }
+            await redis_client.set(poll_redis_key, json.dumps(poll_payload), ex=300)
+            ic(f"Successfully mapped tokens to temp_id {effective_temp_id} in Redis for polling")
+    except Exception as token_err:
+        ic(f"Error pre-generating tokens for auth_poll: {token_err}")
     
     def append_query_param(url: str, key: str, value: str) -> str:
         from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
@@ -1298,7 +1687,11 @@ async def callback(
     else:
         srv_upper = service.upper() if service else ""
         ent_lower = entity_type.lower() if entity_type else ""
-        is_app_redirect = bool(is_app_flow or ent_lower == "app" or (additional_infos and (additional_infos.get("is_app") or additional_infos.get("client_type") == "app")))
+        is_app_redirect = bool(
+            is_app_flow
+            or ent_lower in ("app", "mobile")
+            or (additional_infos and (additional_infos.get("is_app") or str(additional_infos.get("client_type") or "").lower() in ("app", "mobile") or str(additional_infos.get("entity_type") or "").lower() in ("app", "mobile")))
+        )
         if is_app_redirect:
             base_redirect_url = SETTINGS.APP_DEEP_LINK
         elif (srv_upper == "HYPERLOCAL" or srv_upper == "HYPERLOCAL-INVENTORY") and ent_lower == "website":
@@ -1307,11 +1700,79 @@ async def callback(
             base_redirect_url = f"{SETTINGS.FRONTEND_URL}/auth/callback"
 
     redirect_url = append_query_param(base_redirect_url, "token_id", login_id)
+    if effective_temp_id:
+        redirect_url = append_query_param(redirect_url, "temp_id", effective_temp_id)
     if is_signup_flow:
         redirect_url = append_query_param(redirect_url, "flow", "signup")
     else:
         redirect_url = append_query_param(redirect_url, "flow", "signin")
     return RedirectResponse(url=redirect_url)
+
+
+@router.get("/poll-status")
+@router.get("/session-status")
+@router.get("/poll")
+async def poll_auth_status(temp_id: str = Query(...)):
+    """
+    Polling endpoint for ShopiQ mobile app:
+    Polls the backend by temp_id every 5 seconds until auth verification completes.
+    - 'pending': User hasn't finished browser authentication yet.
+    - 'authenticated': Returns access_token, refresh_token, and user info.
+    - 'expired': Session expired (>5 mins) or invalid.
+    """
+    if not temp_id or not temp_id.strip():
+        raise HTTPException(status_code=400, detail="temp_id is required")
+
+    clean_temp_id = temp_id.strip()
+    poll_key = f"auth_poll:{clean_temp_id}"
+    data_str = await redis_client.get(poll_key)
+
+    if not data_str:
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "expired",
+                "temp_id": clean_temp_id,
+                "message": "Authentication session expired or not found."
+            }
+        )
+
+    try:
+        data = json.loads(data_str)
+    except Exception:
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "expired",
+                "temp_id": clean_temp_id,
+                "message": "Corrupted auth session."
+            }
+        )
+
+    if data.get("status") == "authenticated":
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "authenticated",
+                "temp_id": clean_temp_id,
+                "access_token": data.get("access_token"),
+                "refresh_token": data.get("refresh_token"),
+                "token_type": data.get("token_type", "bearer"),
+                "expires_in": data.get("expires_in", 3600),
+                "user_id": data.get("user_id"),
+                "email": data.get("email"),
+                "mobilenumber": data.get("mobilenumber")
+            }
+        )
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "status": "pending",
+            "temp_id": clean_temp_id,
+            "message": "Waiting for user authentication in browser."
+        }
+    )
 
 @router.post("/refresh")
 async def refresh_token(data: RefreshSchema):
@@ -1495,7 +1956,7 @@ async def login_with_password(data: LoginRequestSchema):
     if data.mobilenumber:
         query_or.append({"mobilenumber": data.mobilenumber.strip()})
         
-    user_doc = await users_coll.find_one({"$or": query_or}) if query_or else None
+    user_doc = await users_coll.find_one({"$or": query_or, "is_deleted": {"$ne": True}}) if query_or else None
     if not user_doc:
         raise HTTPException(status_code=401, detail="Invalid email/mobile or password.")
         
@@ -1613,13 +2074,338 @@ async def get_user_by_mobile(mobilenumber: str):
         raise HTTPException(status_code=404, detail="User not found")
     return user
 
+def _mask_email(email: str) -> str:
+    if not email or "@" not in email:
+        return email or ""
+    parts = email.split("@")
+    name, domain = parts[0], parts[1]
+    if len(name) <= 2:
+        masked = name[0] + "*"
+    else:
+        masked = name[0] + "*" * (len(name) - 2) + name[-1]
+    return f"{masked}@{domain}"
+
+@router.post("/account-deletion/request-otp")
+@router.post("/delete-account/request-otp")
+async def request_account_deletion_otp(data: RequestAccountDeletionOtpSchema):
+    if not data.user_id and not data.email:
+        raise HTTPException(status_code=400, detail="User ID or email is required.")
+
+    users_coll = get_collection("users")
+    query_or = []
+    if data.user_id:
+        query_or.append({"user_id": data.user_id})
+    if data.email:
+        clean_email = data.email.strip().lower()
+        query_or.append({"email": clean_email})
+        query_or.append({"email": {"$regex": f"^{re.escape(clean_email)}$", "$options": "i"}})
+
+    user_doc = await users_coll.find_one({"$or": query_or, "is_deleted": {"$ne": True}}) if query_or else None
+    if not user_doc:
+        raise HTTPException(status_code=404, detail="User account not found.")
+
+    if user_doc.get("is_deleted") is True:
+        raise HTTPException(status_code=400, detail="This account has already been deleted.")
+
+    user_email = user_doc.get("email")
+    if not user_email:
+        raise HTTPException(status_code=400, detail="No registered Gmail address found for this account to receive verification code.")
+
+    user_id = user_doc["user_id"]
+    user_name = user_doc.get("name") or user_doc.get("first_name") or "ShopiQ Customer"
+
+    # Generate 6-digit numeric OTP
+    import secrets
+    otp = f"{secrets.randbelow(900000) + 100000}"
+
+    # Store OTP in Redis for 10 minutes (600 seconds) under all identifier keys
+    redis_keys_to_set = [f"del_account_otp:{user_id}"]
+    if user_email:
+        clean_uemail = user_email.split("__deleted")[0].strip().lower()
+        redis_keys_to_set.append(f"del_account_otp:email:{clean_uemail}")
+    if data.user_id and data.user_id != user_id:
+        redis_keys_to_set.append(f"del_account_otp:{data.user_id}")
+    if data.email:
+        redis_keys_to_set.append(f"del_account_otp:email:{data.email.strip().lower()}")
+
+    for k in set(redis_keys_to_set):
+        await redis_client.set(k, otp, ex=600)
+
+    # Dispatch verification email to user's Gmail
+    email_sent = await send_account_deletion_otp_email(email=user_email, name=user_name, otp=otp)
+    if not email_sent:
+        ic(f"[SoftDelete] Warning: Email dispatch returned false for {user_email}")
+
+    return {
+        "success": True,
+        "message": f"A 6-digit verification code has been sent to your registered Gmail address: {_mask_email(user_email)}.",
+        "email": _mask_email(user_email),
+        "user_id": user_id
+    }
+
+@router.post("/account-deletion/verify-otp")
+@router.post("/delete-account/verify-otp")
+async def verify_account_deletion_otp(data: VerifyAccountDeletionOtpSchema):
+    raw_user_id = (data.user_id or "").strip()
+    raw_email = (data.email or "").strip().lower()
+    otp_entered = data.otp.strip()
+
+    if (not raw_user_id and not raw_email) or not otp_entered:
+        raise HTTPException(status_code=400, detail="User ID or email, and verification code are required.")
+
+    # Collect candidate Redis keys
+    candidate_keys = []
+    if raw_user_id:
+        candidate_keys.append(f"del_account_otp:{raw_user_id}")
+    if raw_email:
+        candidate_keys.append(f"del_account_otp:email:{raw_email}")
+
+    users_coll = get_collection("users")
+    user_doc = None
+    if raw_user_id:
+        user_doc = await users_coll.find_one({"user_id": raw_user_id})
+    if not user_doc and raw_email:
+        user_doc = await users_coll.find_one({"email": raw_email, "is_deleted": {"$ne": True}})
+    if not user_doc and raw_email:
+        user_doc = await users_coll.find_one({"email": {"$regex": f"^{re.escape(raw_email)}$", "$options": "i"}, "is_deleted": {"$ne": True}})
+
+    if user_doc:
+        doc_uid = user_doc.get("user_id")
+        doc_email = (user_doc.get("email") or "").split("__deleted")[0].strip().lower()
+        if doc_uid and f"del_account_otp:{doc_uid}" not in candidate_keys:
+            candidate_keys.append(f"del_account_otp:{doc_uid}")
+        if doc_email and f"del_account_otp:email:{doc_email}" not in candidate_keys:
+            candidate_keys.append(f"del_account_otp:email:{doc_email}")
+
+    # Check Redis for any matching OTP key
+    stored_otp = None
+    for k in candidate_keys:
+        val = await redis_client.get(k)
+        if val:
+            stored_otp = val
+            break
+
+    if not stored_otp:
+        raise HTTPException(status_code=400, detail="Verification code has expired or is invalid. Please request a new code.")
+
+    if stored_otp != otp_entered:
+        raise HTTPException(status_code=400, detail="Invalid verification code. Please check your Gmail and try again.")
+
+    # Invalidate OTP from Redis immediately across candidate keys
+    for k in candidate_keys:
+        try:
+            await redis_client.delete(k)
+        except Exception:
+            pass
+
+    # Resolve target user document to soft-delete
+    target_user_doc = user_doc
+    if not target_user_doc or target_user_doc.get("is_deleted") is True:
+        email_to_find = raw_email or (user_doc.get("original_email") if user_doc else None) or (user_doc.get("email") if user_doc else None)
+        if email_to_find:
+            clean_email_to_find = email_to_find.split("__deleted")[0].strip().lower()
+            active_doc = await users_coll.find_one({
+                "$or": [
+                    {"email": clean_email_to_find},
+                    {"email": {"$regex": f"^{re.escape(clean_email_to_find)}$", "$options": "i"}}
+                ],
+                "is_deleted": {"$ne": True}
+            })
+            if active_doc:
+                target_user_doc = active_doc
+
+    if not target_user_doc:
+        raise HTTPException(status_code=404, detail="User account not found.")
+
+    target_user_id = target_user_doc["user_id"]
+    now_utc = datetime.datetime.utcnow()
+
+    scope = (data.scope or "shopiq").lower()
+
+    if scope == "shopiq":
+        # ─────────────────────────────────────────────────────────────
+        # SHOPIQ CUSTOMER DELETION ONLY
+        # Only deletes consumer shopping profile, addresses, and favorites.
+        # DOES NOT touch inventQ retailer account, stores, or merchant data.
+        # ─────────────────────────────────────────────────────────────
+        from infras.db.mongo import MongoDBManager
+        if MongoDBManager.client:
+            # 1. SOFT DELETE customer profile in DigitalStoreUserServiceDb
+            try:
+                for ds_name in ["DigitalStoreUserServiceDb", "DigitalStoreUserDb"]:
+                    ds_db = MongoDBManager.client[ds_name]
+                    await ds_db["users"].update_one(
+                        {"user_id": target_user_id},
+                        {
+                            "$set": {
+                                "is_deleted": True,
+                                "deleted_at": now_utc,
+                                "updated_at": now_utc,
+                                "addresses": []
+                            }
+                        }
+                    )
+                    await ds_db["search_histories"].delete_many({"user_id": target_user_id})
+                    await ds_db["favourite_products"].delete_many({"user_id": target_user_id})
+                    await ds_db["favourite_shops"].delete_many({"user_id": target_user_id})
+            except Exception as e:
+                ic(f"[SoftDelete:ShopiQ] Error updating DigitalStoreUserServiceDb: {e}")
+
+            # 2. Mark online customer orders as user_deleted in OrdersDb (hidden from customer app, kept for retailer on inventQ)
+            try:
+                orders_db = MongoDBManager.client["OrdersDb"]
+                await orders_db["OrdersCollection"].update_many(
+                    {"online_details.user_id": target_user_id},
+                    {
+                        "$set": {
+                            "online_details.user_deleted": True,
+                            "user_deleted": True
+                        }
+                    }
+                )
+            except Exception as e:
+                ic(f"[SoftDelete:ShopiQ] Error updating OrdersDb: {e}")
+
+        # 3. Clean up active mobile app polling tokens in Redis
+        try:
+            user_tokens_pattern = f"auth_poll:{target_user_id}*"
+            keys = await redis_client.keys(user_tokens_pattern)
+            if keys:
+                await redis_client.delete(*keys)
+        except Exception as e:
+            ic(f"[SoftDelete:ShopiQ] Redis token cleanup: {e}")
+
+        return {
+            "success": True,
+            "scope": "shopiq",
+            "message": "Your ShopiQ customer account, saved addresses, and shopping history have been deleted successfully. Your inventQ retail stores and merchant account remain completely active."
+        }
+
+    # ─────────────────────────────────────────────────────────────
+    # INVENTQ / FULL ACCOUNT DELETION
+    # ─────────────────────────────────────────────────────────────
+    orig_email = target_user_doc.get("email")
+    orig_mobile = target_user_doc.get("mobilenumber")
+    del_suffix = f"__deleted_{int(now_utc.timestamp())}_{target_user_id[:8]}"
+
+    update_fields = {
+        "is_deleted": True,
+        "deleted_at": now_utc,
+        "status": "deleted",
+        "original_email": orig_email,
+        "original_mobilenumber": orig_mobile,
+        "updated_at": now_utc
+    }
+    if orig_email and not orig_email.endswith("__deleted"):
+        update_fields["email"] = f"{orig_email}{del_suffix}"
+    if orig_mobile and "__deleted" not in orig_mobile:
+        update_fields["mobilenumber"] = f"{orig_mobile}{del_suffix}"
+
+    await users_coll.update_one(
+        {"user_id": target_user_id},
+        {"$set": update_fields}
+    )
+
+    from infras.db.mongo import MongoDBManager
+    if MongoDBManager.client:
+        try:
+            for ds_name in ["DigitalStoreUserServiceDb", "DigitalStoreUserDb"]:
+                ds_db = MongoDBManager.client[ds_name]
+                ds_update = {
+                    "is_deleted": True,
+                    "deleted_at": now_utc,
+                    "original_email": orig_email,
+                    "original_mobilenumber": orig_mobile,
+                    "updated_at": now_utc
+                }
+                if orig_email and not orig_email.endswith("__deleted"):
+                    ds_update["email"] = f"{orig_email}{del_suffix}"
+                if orig_mobile and "__deleted" not in orig_mobile:
+                    ds_update["mobilenumber"] = f"{orig_mobile}{del_suffix}"
+
+                await ds_db["users"].update_one(
+                    {"user_id": target_user_id},
+                    {"$set": ds_update}
+                )
+                await ds_db["search_histories"].delete_many({"user_id": target_user_id})
+                await ds_db["favourite_products"].delete_many({"user_id": target_user_id})
+                await ds_db["favourite_shops"].delete_many({"user_id": target_user_id})
+        except Exception as e:
+            ic(f"[SoftDelete:Full] Error updating DigitalStoreUserServiceDb: {e}")
+
+        try:
+            orders_db = MongoDBManager.client["OrdersDb"]
+            await orders_db["OrdersCollection"].update_many(
+                {"online_details.user_id": target_user_id},
+                {
+                    "$set": {
+                        "online_details.user_deleted": True,
+                        "user_deleted": True
+                    }
+                }
+            )
+        except Exception as e:
+            ic(f"[SoftDelete:Full] Error updating OrdersDb: {e}")
+
+    try:
+        user_tokens_pattern = f"auth_poll:{target_user_id}*"
+        keys = await redis_client.keys(user_tokens_pattern)
+        if keys:
+            await redis_client.delete(*keys)
+    except Exception as e:
+        ic(f"[SoftDelete:Full] Redis token cleanup: {e}")
+
+    return {
+        "success": True,
+        "scope": scope,
+        "message": "Your account has been deleted successfully."
+    }
+
 @router.delete("/users/{user_id}")
 async def delete_user(user_id: str):
+    """Soft delete user account across services while preserving order records."""
     users_coll = get_collection("users")
-    res = await users_coll.delete_one({"user_id": user_id})
-    if res.deleted_count == 0:
+    user = await users_coll.find_one({"user_id": user_id})
+    if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    return {"message": "User deleted successfully"}
+
+    now_utc = datetime.datetime.utcnow()
+    await users_coll.update_one(
+        {"user_id": user_id},
+        {
+            "$set": {
+                "is_deleted": True,
+                "deleted_at": now_utc,
+                "status": "deleted",
+                "updated_at": now_utc
+            }
+        }
+    )
+
+    from infras.db.mongo import MongoDBManager
+    if MongoDBManager.client:
+        try:
+            ds_db = MongoDBManager.client["DigitalStoreUserDb"]
+            await ds_db["users"].update_one(
+                {"user_id": user_id},
+                {"$set": {"is_deleted": True, "deleted_at": now_utc, "updated_at": now_utc}}
+            )
+            await ds_db["search_histories"].delete_many({"user_id": user_id})
+            await ds_db["favourite_products"].delete_many({"user_id": user_id})
+            await ds_db["favourite_shops"].delete_many({"user_id": user_id})
+        except Exception as e:
+            ic(f"[SoftDelete] Error updating DigitalStoreUserDb: {e}")
+
+        try:
+            orders_db = MongoDBManager.client["OrdersDb"]
+            await orders_db["OrdersCollection"].update_many(
+                {"online_details.user_id": user_id},
+                {"$set": {"online_details.user_deleted": True, "user_deleted": True}}
+            )
+        except Exception as e:
+            ic(f"[SoftDelete] Error updating OrdersDb: {e}")
+
+    return {"message": "User soft-deleted successfully"}
 
 
 # Password Reset & Management Endpoints
@@ -1638,7 +2424,7 @@ async def forgot_password(data: ForgotPasswordSchema):
     if data.mobilenumber:
         query_or.append({"mobilenumber": data.mobilenumber.strip()})
         
-    user_doc = await users_coll.find_one({"$or": query_or}) if query_or else None
+    user_doc = await users_coll.find_one({"$or": query_or, "is_deleted": {"$ne": True}}) if query_or else None
     if not user_doc:
         raise HTTPException(status_code=404, detail="User with this email/mobile number not found.")
         
@@ -1692,7 +2478,7 @@ async def reset_password(data: ResetPasswordSchema):
     if not query_or:
         raise HTTPException(status_code=400, detail="Reset token, user_id, email, or mobile number is required.")
         
-    user_doc = await users_coll.find_one({"$or": query_or})
+    user_doc = await users_coll.find_one({"$or": query_or, "is_deleted": {"$ne": True}})
     if not user_doc:
         raise HTTPException(status_code=404, detail="User not found.")
         
@@ -1727,7 +2513,7 @@ async def change_password(data: ChangePasswordSchema):
     if not query_or:
         raise HTTPException(status_code=400, detail="User identifier (user_id, email, or mobile number) is required.")
         
-    user_doc = await users_coll.find_one({"$or": query_or})
+    user_doc = await users_coll.find_one({"$or": query_or, "is_deleted": {"$ne": True}})
     if not user_doc:
         raise HTTPException(status_code=404, detail="User not found.")
         

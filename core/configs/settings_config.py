@@ -31,6 +31,16 @@ class Settings(BaseSettings):
         url = (self.BACKEND_URL or f"http://127.0.0.1:{self.PORT}").rstrip("/")
         return url
 
+    def get_app_verify_url(self, custom_url: str = None) -> str:
+        if custom_url:
+            return custom_url
+        return f"{self.get_public_base_url()}/auth/app/verify"
+
+    def get_app_redirect_url(self, custom_url: str = None) -> str:
+        if custom_url:
+            return custom_url
+        return f"{self.get_public_base_url()}/auth/signin/redirect"
+
     def get_verify_url(self, custom_url: str = None) -> str:
         if custom_url:
             return custom_url
@@ -56,11 +66,11 @@ class Settings(BaseSettings):
             return custom_url
         return f"{self.get_public_base_url()}/auth/signup/redirect"
 
-    SMTP_HOST: str = "smtp.gmail.com"
-    SMTP_PORT: int = 587
-    SMTP_USER: str = ""
-    SMTP_PASS: str = ""
-    SMTP_FROM_EMAIL: str = ""
+    SMTP_HOST: str = os.getenv("AUTH_SMTP_HOST", os.getenv("SHOP_EMP_SMTP_HOST", "smtp.gmail.com"))
+    SMTP_PORT: int = int(os.getenv("AUTH_SMTP_PORT", os.getenv("SHOP_EMP_SMTP_PORT", "587")))
+    SMTP_USER: str = os.getenv("AUTH_SMTP_USER", os.getenv("SHOP_EMP_SMTP_USER", "debuggerstechs@gmail.com"))
+    SMTP_PASS: str = os.getenv("AUTH_SMTP_PASS", os.getenv("SHOP_EMP_SMTP_PASS", "orek ofgh mjii eqcx"))
+    SMTP_FROM_EMAIL: str = os.getenv("AUTH_SMTP_FROM_EMAIL", os.getenv("SHOP_EMP_SMTP_USER", "debuggerstechs@gmail.com"))
 
     # In non-production environments (ENVIRONMENT != 'production'), only users in DEV_ALLOWED_USERS can access
     RESTRICT_DEV_USERS: bool = os.getenv("RESTRICT_DEV_USERS", "true").lower() in ("true", "1", "yes")
@@ -78,14 +88,15 @@ class Settings(BaseSettings):
         except Exception:
             return []
 
-    def is_dev_allowed(self, email: str = None, password: str = None, mobilenumber: str = None) -> tuple[bool, str]:
+    def is_dev_allowed(self, email: str = None, password: str = None, mobilenumber: str = None, is_app: bool = False) -> tuple[bool, str]:
         """
         Validates development environment user access.
-        If in production, always returns (True, "").
+        If in production, or is_app is True, or RESTRICT_DEV_USERS is False:
+        always returns (True, "").
         If in non-production and RESTRICT_DEV_USERS is True (default: True),
         ONLY users listed in DEV_ALLOWED_USERS are permitted.
         """
-        if self.ENVIRONMENT.lower() == "production" or not self.RESTRICT_DEV_USERS:
+        if self.ENVIRONMENT.lower() == "production" or not self.RESTRICT_DEV_USERS or is_app:
             return True, ""
             
         allowed_list = self.get_dev_allowed_users()
