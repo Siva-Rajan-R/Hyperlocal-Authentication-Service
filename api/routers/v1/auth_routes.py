@@ -1340,6 +1340,16 @@ async def callback(
             or detected_flow
             or "signin"
         )
+
+    # Resolve effective_temp_id for polling mapping and customer identification
+    effective_temp_id = (
+        temp_id
+        or request.query_params.get("temp_id")
+        or (additional_infos.get("temp_id") if isinstance(additional_infos, dict) else None)
+        or cookie_temp_id
+    )
+    if isinstance(effective_temp_id, str):
+        effective_temp_id = effective_temp_id.strip() or None
     
     # Store user if not exists
     raw_email = deb_user_info.get("email")
@@ -1601,13 +1611,16 @@ async def callback(
     
     await redis_client.set(new_redis_key, json.dumps(user_context), ex=120)
 
-    # Resolve effective_temp_id for polling mapping
-    effective_temp_id = (
-        temp_id
-        or request.query_params.get("temp_id")
-        or (additional_infos.get("temp_id") if isinstance(additional_infos, dict) else None)
-        or cookie_temp_id
-    )
+    # Resolve effective_temp_id for polling mapping if not already resolved
+    if not effective_temp_id:
+        effective_temp_id = (
+            temp_id
+            or request.query_params.get("temp_id")
+            or (additional_infos.get("temp_id") if isinstance(additional_infos, dict) else None)
+            or cookie_temp_id
+        )
+        if isinstance(effective_temp_id, str):
+            effective_temp_id = effective_temp_id.strip() or None
 
     # Pre-generate JWT access & refresh tokens for polling clients (ShopiQ) and store in Redis
     try:
